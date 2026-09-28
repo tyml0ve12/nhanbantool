@@ -1,0 +1,18 @@
+# File nang - di kem bo cai tren Google Drive, KHONG dua len git
+models/
+bin/
+dist/
+
+# Du lieu sinh ra khi chay
+cache/
+logs/
+__pycache__/
+*.pyc
+.installed
+
+# Project mau + tai lieu noi bo
+project mẫu/
+requement-nhan-ban.md
+HUONG_DAN_BUILD_VA_UPDATE.md
+*.dubbed*.json
+draft_content.backup_*.json
