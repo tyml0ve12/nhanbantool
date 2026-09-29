@@ -67,13 +67,19 @@ def build_dub_wav(source_audio: str, placements: list, total_duration: float, ou
             written = 0
             for target, cut_from, length in placements:
                 t0 = int(round(target * SAMPLE_RATE))
+                s0 = int(round(cut_from * SAMPLE_RATE))
+                want = int(round(length * SAMPLE_RATE))
                 if t0 < written:
-                    raise AudioError("Các câu bị chồng lên nhau khi dựng audio (lỗi nội bộ).")
+                    # 2 cau NOI SAT nhau: lam tron micro-giay -> mau co the lech 1-2 mau.
+                    # Lech nho (<10ms) thi bo phan du o dau cau sau; lech lon moi la loi that.
+                    overlap = written - t0
+                    if overlap > SAMPLE_RATE // 100:
+                        raise AudioError("Các câu bị chồng lên nhau khi dựng audio (lỗi nội bộ).")
+                    t0, s0, want = written, s0 + overlap, want - overlap
                 if t0 >= total_frames:
                     break
                 _write_silence(out, t0 - written)
-                s0 = int(round(cut_from * SAMPLE_RATE))
-                n = min(int(round(length * SAMPLE_RATE)), total_frames - t0, max(0, src_frames - s0))
+                n = min(want, total_frames - t0, max(0, src_frames - s0))
                 src.seek(s0 * BYTES_PER_FRAME)
                 data = src.read(n * BYTES_PER_FRAME)
                 out.writeframes(_fade(data))
@@ -129,15 +135,51 @@ def aac_encoder_args() -> list:
     return list(_aac_args)
 
 
+def probe_video_size(path: str) -> tuple:
+    result = _run([find_ffprobe(), "-v", "error", "-select_streams", "v:0", "-show_entries",
+                   "stream=width,height", "-of", "csv=p=0:s=x", path])
+    try:
+        w, h = result.stdout.strip().split("x")[:2]
+        return int(w), int(h)
+    except ValueError:
+        raise AudioError(f"Không đọc được kích thước video: {os.path.basename(path)}")
+
+
 def mux_video(video_path: str, audio_wav: str, out_path: str,
-              on_progress: Callable[[int], None], should_stop: Callable[[], bool]):
-    """Giu nguyen hinh (copy, khong encode lai, giu nguyen do phan giai), thay
-    toan bo tieng bang audio long tieng."""
+              on_progress: Callable[[int], None], should_stop: Callable[[], bool],
+              logo_png: str = "", logo_geometry: tuple = None, on_log: Callable[[str], None] = None):
+    """Thay toan bo tieng bang audio long tieng.
+    - Khong co logo: COPY hinh (khong encode lai, giu nguyen do phan giai) - vai giay.
+    - Co logo: ve logo len hinh (suot video, ro 100%) -> phai encode lai; thu lan
+      luot bo nen nhanh nhat (NVENC -> QSV -> AMF -> CPU), bo nao loi thi thu bo sau."""
+    if not logo_png:
+        _mux_once(video_path, audio_wav, out_path, on_progress, should_stop, ["-c:v", "copy"], [])
+        return
+    from core.encoder import usable_encoders
+    x, y, w, h = logo_geometry
+    graph = f"[2:v]scale={w}:{h}[lg];[0:v][lg]overlay={x}:{y}:format=auto,format=yuv420p[v]"
+    last_error = None
+    for name, label, params in usable_encoders():
+        if on_log:
+            on_log(f"Chèn logo + nén hình bằng {label}…")
+        try:
+            _mux_once(video_path, audio_wav, out_path, on_progress, should_stop,
+                      ["-c:v", name] + params, ["-i", logo_png, "-filter_complex", graph], video_map="[v]")
+            return
+        except AudioError as e:
+            last_error = e
+            if on_log:
+                on_log(f"{label} lỗi, thử bộ nén khác…")
+    raise last_error or AudioError("Không nén được video có logo.")
+
+
+def _mux_once(video_path, audio_wav, out_path, on_progress, should_stop, video_args, extra_inputs,
+              video_map="0:v:0"):
     duration = probe_duration(video_path)
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     tmp_out = out_path + ".part.mp4"
-    args = [find_ffmpeg(), "-hide_banner", "-y", "-i", video_path, "-i", audio_wav,
-            "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy"] + aac_encoder_args() + [
+    args = [find_ffmpeg(), "-hide_banner", "-y", "-i", video_path, "-i", audio_wav] + extra_inputs + [
+            "-map", video_map, "-map", "1:a:0"] + video_args + aac_encoder_args() + [
             "-b:a", "192k", "-t", f"{duration:.3f}", "-movflags", "+faststart",
             "-progress", "pipe:1", "-nostats", tmp_out]
     err_file = tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace")

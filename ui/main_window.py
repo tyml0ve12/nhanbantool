@@ -3,8 +3,8 @@ import logging
 import os
 from datetime import datetime
 
-from PySide6.QtCore import Qt, QSettings, QTimer
-from PySide6.QtGui import QColor
+from PySide6.QtCore import Qt, QSettings, QTimer, QThread, Signal, QUrl
+from PySide6.QtGui import QColor, QDesktopServices
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QGroupBox,
     QLabel, QLineEdit, QPushButton, QFileDialog, QComboBox, QTableWidget,
@@ -20,6 +20,14 @@ from core.capcut_project import (
 )
 from core.speech import detect_device, is_model_downloaded
 from core.version import APP_VERSION
+from core.encoder import NVIDIA_DRIVER_URL, nvidia_status
+from core.parts import audio_files_in, is_merged_file, sort_parts
+from ui.language_dialog import (
+    COMMON_LANGUAGES, MultiLanguageDialog, parts_tooltip, pick_parts, summarize_parts,
+)
+from ui.logo_dialog import edit_logo, logo_label
+from core.render import probe_video
+from ui.export_dialog import ExportDialog
 from ui.update_ui import UpdateController
 from ui.run_worker import RunWorker, RunConfig, LanguageJob, MODE_DRAFT, MODE_EXPORT, MODE_BOTH
 
@@ -28,7 +36,8 @@ log = logging.getLogger("main_window")
 APP_SIGNATURE = "BrightStar - Hoàng Đức"
 APP_TITLE = f"Nhân Bản Lồng Tiếng — {APP_SIGNATURE}"
 
-COL_CHECK, COL_NAME, COL_AUDIO, COL_STATUS = range(4)
+COL_CHECK, COL_NAME, COL_AUDIO, COL_LOGO, COL_STATUS = range(5)
+LANG_STATUS_COLORS = {"ok": "#e8e8e8", "warn": "#e0b04a", "error": "#ff6b6b"}
 
 # (nhan hien thi, ten model faster-whisper). Model tai ve 1 lan o lan chay dau.
 WHISPER_MODELS = (
@@ -73,6 +82,18 @@ RUN_BUTTON_STYLE = (
 )
 
 
+class NvidiaCheckWorker(QThread):
+    """Kiem tra ngam (vai tram ms): may co card NVIDIA ma driver qua cu cho NVENC khong."""
+    done = Signal(object)
+
+    def run(self):
+        try:
+            self.done.emit(nvidia_status())
+        except Exception:
+            log.exception("Khong kiem tra duoc driver NVIDIA")
+            self.done.emit(None)
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -82,6 +103,7 @@ class MainWindow(QMainWindow):
         self.settings = QSettings()
         self.project = None
         self.project_registered = False
+        self.export_dialog = None
         self._loaded_path = ""
         self.worker = None
         self.updates = UpdateController(self, has_unsaved_work=lambda: bool(self.worker and self.worker.isRunning()))
@@ -108,6 +130,19 @@ class MainWindow(QMainWindow):
         self.setStatusBar(QStatusBar())
         self.capcut_label = QLabel()
         self.statusBar().addWidget(self.capcut_label)
+        # Canh bao driver NVIDIA cu (an cho toi khi kiem tra ngam xong)
+        self.driver_btn = QPushButton()
+        self.driver_btn.setFlat(True)
+        self.driver_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.driver_btn.setStyleSheet("color: #e0b04a; font-weight: bold;")
+        self.driver_btn.clicked.connect(self._show_driver_help)
+        self.driver_btn.hide()
+        self.statusBar().addPermanentWidget(self.driver_btn)
+        self.nvidia = None
+        self.nvidia_worker = NvidiaCheckWorker(self)
+        self.nvidia_worker.done.connect(self._on_nvidia_checked)
+        QTimer.singleShot(1500, self.nvidia_worker.start)
+
         signature = QLabel(f"© {APP_SIGNATURE}")
         signature.setObjectName("hint")
         self.statusBar().addPermanentWidget(signature)
@@ -154,6 +189,7 @@ class MainWindow(QMainWindow):
         self.project_info = QLabel("Chưa chọn project.")
         self.project_info.setObjectName("hint")
         self.project_info.setWordWrap(True)
+        self.project_info.setMinimumHeight(self.project_info.fontMetrics().lineSpacing() * 2 + 6)
         grid.addWidget(self.project_info, 2, 1, 1, 2)
 
         grid.addWidget(QLabel("Track thoại gốc"), 3, 0)
@@ -162,7 +198,7 @@ class MainWindow(QMainWindow):
 
         self.video_edit = self._path_row(grid, 4, "Video gốc (.mp4)",
                                          "Chỉ cần khi xuất mp4", self._browse_video)
-        self.output_edit = self._path_row(grid, 5, "Thư mục xuất mp4",
+        self.output_edit = self._path_row(grid, 5, "Thư mục xuất (mặc định)",
                                           "Mặc định: thư mục 'Xuất lồng tiếng' cạnh project", self._browse_output)
         self._refresh_capcut_projects()
         return box
@@ -191,26 +227,31 @@ class MainWindow(QMainWindow):
 
         toolbar = QHBoxLayout()
         add_btn = QPushButton("＋ Thêm file audio")
-        add_btn.clicked.connect(self._add_audio_files)
-        scan_btn = QPushButton("Quét thư mục audio…")
-        scan_btn.clicked.connect(self._scan_audio_folder)
+        add_btn.setToolTip("Thêm 1 ngôn ngữ. Ngôn ngữ có nhiều phần (1.mp3 … 10.mp3) thì chọn tất cả các phần.")
+        add_btn.clicked.connect(self._add_one_language)
+        multi_btn = QPushButton("＋ Thêm nhiều ngôn ngữ…")
+        multi_btn.setToolTip("Thêm nhiều ngôn ngữ 1 lần: tên ngôn ngữ, file audio, logo kênh")
+        multi_btn.clicked.connect(self._add_many_languages)
         remove_btn = QPushButton("Xoá dòng")
         remove_btn.clicked.connect(self._remove_selected)
-        for b in (add_btn, scan_btn):
+        for b in (add_btn, multi_btn):
             toolbar.addWidget(b)
         toolbar.addStretch(1)
         toolbar.addWidget(remove_btn)
         v.addLayout(toolbar)
 
-        self.table = QTableWidget(0, 4)
-        self.table.setHorizontalHeaderLabels(["", "Tên ngôn ngữ (tên track)", "File audio", "Trạng thái"])
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(["", "Ngôn ngữ (tên track)", "File audio", "Logo kênh", "Trạng thái"])
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(COL_CHECK, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(COL_NAME, QHeaderView.ResizeMode.Interactive)
         header.setSectionResizeMode(COL_AUDIO, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(COL_LOGO, QHeaderView.ResizeMode.Interactive)
         header.setSectionResizeMode(COL_STATUS, QHeaderView.ResizeMode.Interactive)
-        self.table.setColumnWidth(COL_NAME, 210)
-        self.table.setColumnWidth(COL_STATUS, 220)
+        self.table.setColumnWidth(COL_NAME, 180)
+        self.table.setColumnWidth(COL_LOGO, 140)
+        self.table.setColumnWidth(COL_STATUS, 200)
+        self.table.cellDoubleClicked.connect(self._on_cell_double_clicked)
         self.table.verticalHeader().setVisible(False)
         self.table.setMinimumHeight(160)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -224,8 +265,8 @@ class MainWindow(QMainWindow):
         self.table.dropEvent = self._drop_files
         v.addWidget(self.table)
 
-        hint = QLabel("Kéo thả file audio vào bảng. Bấm đúp vào tên để sửa — tên này sẽ là tên track trong CapCut "
-                      "và tên file mp4. Ranh giới từng câu được tự nhận dạng bằng giọng nói (faster-whisper).")
+        hint = QLabel("Bấm đúp vào tên để sửa (= tên track CapCut + tên file mp4) · bấm đúp File audio để chọn lại "
+                      "các phần · logo chỉ chèn khi xuất mp4. Kéo thả file/thư mục vào bảng = thêm 1 ngôn ngữ.")
         hint.setObjectName("hint")
         hint.setWordWrap(True)
         v.addWidget(hint)
@@ -280,6 +321,7 @@ class MainWindow(QMainWindow):
         h.addWidget(self.stop_btn)
         self.run_btn = QPushButton("Chạy")
         self.run_btn.setStyleSheet(RUN_BUTTON_STYLE)
+        self.run_btn.setMinimumWidth(170)
         self.run_btn.clicked.connect(self._start_run)
         h.addWidget(self.run_btn)
         return box
@@ -364,8 +406,8 @@ class MainWindow(QMainWindow):
         else:
             self.project_info.setObjectName("projectError")
             self.project_info.setText(
-                summary + "\n⚠ Thư mục này KHÔNG phải project CapCut đang quản lý (có thể là bản copy) — "
-                "CapCut sẽ không thấy thay đổi. Hãy chọn project ở ô 'Project CapCut' phía trên.")
+                summary + "\n⚠ Không phải project CapCut đang quản lý (bản copy?) — CapCut sẽ không thấy "
+                "thay đổi. Chọn lại ở ô 'Project CapCut'.")
         self._repolish(self.project_info)
         idx = self.capcut_combo.findData(os.path.normpath(info.drafts_dir))
         self.capcut_combo.setCurrentIndex(idx)
@@ -383,9 +425,10 @@ class MainWindow(QMainWindow):
         widget.style().polish(widget)
 
     # ------------------------------------------------------------ Languages
-    def _add_language(self, name, audio):
+    def _add_language(self, name, audio_parts, logo=None):
+        """1 dong = 1 ngon ngu; audio_parts = cac phan (1 file hoac 1.mp3 ... 10.mp3)."""
         for r in range(self.table.rowCount()):
-            if self.table.item(r, COL_AUDIO).data(Qt.ItemDataRole.UserRole) == audio:
+            if self._row_parts(r) == audio_parts:
                 return
         self.table.blockSignals(True)
         r = self.table.rowCount()
@@ -395,48 +438,100 @@ class MainWindow(QMainWindow):
         check.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
         check.setCheckState(Qt.CheckState.Checked)
         self.table.setItem(r, COL_CHECK, check)
-
         self.table.setItem(r, COL_NAME, QTableWidgetItem(name))
-        self._set_readonly(r, COL_AUDIO, os.path.basename(audio), audio)
+        self._set_parts(r, audio_parts)
+        self._set_logo(r, logo)
         self._set_readonly(r, COL_STATUS, "Chờ", None)
         self.table.item(r, COL_STATUS).setForeground(QColor(STATUS_COLORS["wait"]))
         self.table.blockSignals(False)
         self._refresh_default_langs()
 
-    def _set_readonly(self, row, col, text, data):
+    def _set_readonly(self, row, col, text, data, tooltip=None):
         item = QTableWidgetItem(text)
         item.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
         if data is not None:
             item.setData(Qt.ItemDataRole.UserRole, data)
-            item.setToolTip(data)
+        if tooltip or isinstance(data, str):
+            item.setToolTip(tooltip or data)
         self.table.setItem(row, col, item)
+        return item
 
-    def _add_audio_files(self):
-        exts = " ".join(f"*{e}" for e in AUDIO_EXTS)
-        files, _ = QFileDialog.getOpenFileNames(self, "Chọn file audio ngôn ngữ mới",
-                                                self.settings.value("audio_dir", ""), f"Audio ({exts})")
-        for f in files:
-            self._add_audio_path(f)
-        if files:
-            self.settings.setValue("audio_dir", os.path.dirname(files[0]))
+    def _set_parts(self, row, audio_parts):
+        text, kind = summarize_parts(audio_parts)
+        item = self._set_readonly(row, COL_AUDIO, text, list(audio_parts), parts_tooltip(audio_parts))
+        item.setForeground(QColor(LANG_STATUS_COLORS[kind]))
 
-    def _add_audio_path(self, path):
-        path = os.path.normpath(path)
-        self._add_language(language_name_from_file(path), path)
+    def _set_logo(self, row, logo):
+        """logo: None hoac {"path", "placement"} (vi tri/kich thuoc rieng tung ngon ngu)."""
+        self._set_readonly(row, COL_LOGO, "", logo or None)
+        button = QPushButton(logo_label(logo))
+        button.setToolTip((logo or {}).get("path", "") or "Thêm logo kênh (chỉ chèn khi xuất mp4)")
+        button.setStyleSheet("text-align: left; padding: 2px 8px;" + ("" if logo else " color: #9a9a9a;"))
+        button.clicked.connect(lambda _=False, b=button: self._edit_logo(self._row_of_widget(b, COL_LOGO)))
+        self.table.setCellWidget(row, COL_LOGO, button)
 
-    def _scan_audio_folder(self):
-        folder = QFileDialog.getExistingDirectory(self, "Chọn thư mục chứa audio các ngôn ngữ",
-                                                  self.settings.value("audio_dir", ""))
-        if not folder:
+    def _row_of_widget(self, widget, col):
+        for r in range(self.table.rowCount()):
+            if self.table.cellWidget(r, col) is widget:
+                return r
+        return -1
+
+    def _edit_logo(self, row):
+        if row < 0:
             return
-        self.settings.setValue("audio_dir", folder)
-        found = scan_audio_folder(folder)
-        if not found:
-            QMessageBox.information(self, "Quét thư mục", "Không tìm thấy file audio nào trong thư mục này.")
+        changed, logo = edit_logo(self, self.table.item(row, COL_NAME).text().strip(),
+                                  self.video_edit.text().strip(), self._row_logo(row), self._audio_dir())
+        if changed or not logo:
+            self._set_logo(row, logo)
+
+    def _row_parts(self, row):
+        return self.table.item(row, COL_AUDIO).data(Qt.ItemDataRole.UserRole) or []
+
+    def _row_logo(self, row):
+        return self.table.item(row, COL_LOGO).data(Qt.ItemDataRole.UserRole) or None
+
+    def _audio_dir(self):
+        return self.settings.value("audio_dir", "")
+
+    def _add_one_language(self):
+        """Them 1 ngon ngu: 1 file, hoac nhieu phan cua cung 1 ngon ngu."""
+        chosen = pick_parts(self, self._audio_dir())
+        if not chosen:
             return
-        for name, audio in found:
-            self._add_language(name, os.path.normpath(audio))
-        self._log(f"Quét thư mục: thêm {len(found)} ngôn ngữ từ {folder}")
+        self.settings.setValue("audio_dir", os.path.dirname(chosen[0]))
+        self._add_parts_as_language(chosen)
+
+    def _add_parts_as_language(self, chosen, ask_name=True):
+        if len(chosen) == 1:
+            self._add_language(language_name_from_file(chosen[0]), chosen)
+            return
+        # Nhieu phan (1.mp3 ... 10.mp3): ten file khong co ten ngon ngu -> hoi, goi y ten thu muc
+        name = os.path.basename(os.path.dirname(chosen[0])).strip()
+        if ask_name:
+            summary, _ = summarize_parts(chosen)
+            name, ok = QInputDialog.getItem(self, "Tên ngôn ngữ",
+                                            f"{summary}\n\nCác phần này là ngôn ngữ nào?",
+                                            [name] + COMMON_LANGUAGES, 0, True)
+            if not ok or not name.strip():
+                return
+        self._add_language(name.strip(), chosen)
+
+    def _add_many_languages(self):
+        dialog = MultiLanguageDialog(self, self._audio_dir(), video_path=self.video_edit.text().strip())
+        if dialog.exec():
+            entries = dialog.entries()
+            for name, audio_parts, logo in entries:
+                self._add_language(name, audio_parts, logo)
+            self.settings.setValue("audio_dir", dialog.start_dir)
+            self._log(f"Thêm {len(entries)} ngôn ngữ: {', '.join(n for n, _, _ in entries)}")
+
+    def _on_cell_double_clicked(self, row, col):
+        if col == COL_AUDIO:
+            chosen = pick_parts(self, os.path.dirname(self._row_parts(row)[0]) if self._row_parts(row) else "")
+            if chosen:
+                self._set_parts(row, chosen)
+        elif col == COL_LOGO:
+            self._edit_logo(row)
 
     def _remove_selected(self):
         rows = sorted({i.row() for i in self.table.selectedIndexes()}, reverse=True)
@@ -468,14 +563,18 @@ class MainWindow(QMainWindow):
             event.acceptProposedAction()
 
     def _drop_files(self, event):
+        """Keo tha = them 1 ngon ngu (giong nut Them file audio): nhieu file hoac
+        1 thu muc -> cac phan cua 1 ngon ngu."""
+        files = []
         for url in event.mimeData().urls():
-            path = url.toLocalFile()
+            path = os.path.normpath(url.toLocalFile())
             if os.path.isdir(path):
-                for name, audio in scan_audio_folder(path):
-                    self._add_language(name, os.path.normpath(audio))
-            elif path.lower().endswith(AUDIO_EXTS):
-                self._add_audio_path(path)
+                files += audio_files_in(path)
+            elif path.lower().endswith(AUDIO_EXTS) and not is_merged_file(path):
+                files.append(path)
         event.acceptProposedAction()
+        if files:
+            self._add_parts_as_language(sort_parts(files))
 
     # ------------------------------------------------------------------ Run
     def _on_model_changed(self):
@@ -505,8 +604,10 @@ class MainWindow(QMainWindow):
         if len(set(n.lower() for n in names)) != len(names):
             return "Có 2 ngôn ngữ trùng tên — hãy đổi tên để phân biệt track và file mp4."
         for r in rows:
-            if not os.path.isfile(self.table.item(r, COL_AUDIO).data(Qt.ItemDataRole.UserRole)):
-                return f"Không tìm thấy file audio của '{self.table.item(r, COL_NAME).text()}'."
+            missing = [p for p in self._row_parts(r) if not os.path.isfile(p)]
+            if not self._row_parts(r) or missing:
+                return (f"Không tìm thấy file audio của '{self.table.item(r, COL_NAME).text()}'"
+                        + (f": {os.path.basename(missing[0])}" if missing else "") + ".")
         if self._mode() in (MODE_EXPORT, MODE_BOTH):
             if not os.path.isfile(self.video_edit.text().strip()):
                 return "Chế độ xuất mp4 cần chọn video gốc (.mp4)."
@@ -534,10 +635,31 @@ class MainWindow(QMainWindow):
             jobs.append(LanguageJob(
                 row=r,
                 name=self.table.item(r, COL_NAME).text().strip(),
-                audio_path=self.table.item(r, COL_AUDIO).data(Qt.ItemDataRole.UserRole),
+                parts=self._row_parts(r),
+                logo=self._row_logo(r),
             ))
-            self._set_status(r, "Chờ", "wait")
 
+        if self._mode() == MODE_DRAFT:
+            self._begin_run(jobs, track_index, track, None)
+            return
+        # Co xuat mp4 -> hop thoai Xuat video (cau hinh + tien do tung video)
+        try:
+            info = probe_video(self.video_edit.text().strip())
+        except Exception as e:
+            QMessageBox.warning(self, "Video gốc", str(e))
+            return
+        self.export_dialog = ExportDialog(self, self.video_edit.text().strip(), info,
+                                          [(j.row, j.name, bool(j.logo)) for j in jobs],
+                                          self.output_edit.text().strip())
+        self.export_dialog.start_requested.connect(
+            lambda: self._begin_run(jobs, track_index, track, self.export_dialog))
+        self.export_dialog.show()
+
+    def _begin_run(self, jobs, track_index, track, export_dialog):
+        for j in jobs:
+            self._set_status(j.row, "Chờ", "wait")
+        if export_dialog:
+            self.output_edit.setText(export_dialog.dir_edit.text().strip())
         config = RunConfig(
             project_dir=self.project.drafts_dir,
             draft_files=self.project.draft_files,
@@ -550,12 +672,18 @@ class MainWindow(QMainWindow):
             whisper_model=self.model_combo.currentData(),
             device=self.device,
             languages=jobs,
+            render_settings=export_dialog.render_settings() if export_dialog else None,
+            output_paths=export_dialog.output_paths() if export_dialog else {},
         )
         self.worker = RunWorker(config, self)
         self.worker.log.connect(self._log)
         self.worker.language_status.connect(self._set_status)
         self.worker.progress.connect(self.progress_bar.setValue)
         self.worker.finished_all.connect(self._on_finished)
+        if export_dialog:
+            self.worker.language_status.connect(export_dialog.set_status)
+            self.worker.export_progress.connect(export_dialog.set_progress)
+            self.worker.finished_all.connect(lambda ok, err, _p: export_dialog.mark_finished(ok, err))
         self._set_running(True)
         self.progress_bar.setValue(0)
         self.worker.start()
@@ -584,6 +712,32 @@ class MainWindow(QMainWindow):
             item.setForeground(QColor(STATUS_COLORS.get(kind, STATUS_COLORS["wait"])))
 
     # ---------------------------------------------------------------- Misc
+    def _on_nvidia_checked(self, status):
+        self.nvidia = status
+        if status and status.needs_update:
+            self.driver_btn.setText("⚠ Cập nhật driver NVIDIA để xuất video nhanh")
+            self.driver_btn.setToolTip(status.message())
+            self.driver_btn.show()
+            self._log("⚠ " + status.message())
+
+    def _show_driver_help(self):
+        s = self.nvidia
+        box = QMessageBox(self)
+        box.setWindowTitle("Cập nhật driver card rời NVIDIA")
+        box.setTextFormat(Qt.TextFormat.RichText)
+        box.setText(
+            f"Máy có card rời <b>{s.gpu_name}</b> nhưng driver đang dùng (<b>{s.driver}</b>) quá cũ — "
+            f"bộ nén video của card (NVENC) cần driver từ <b>{s.required}</b> trở lên.<br><br>"
+            "Hiện tool vẫn xuất video được bằng bộ nén khác nhưng <b>chậm hơn</b> (chỉ ảnh hưởng khi xuất mp4 "
+            "có logo; nhận dạng giọng nói vẫn chạy trên card rời).<br><br>"
+            "Cách cập nhật: mở trang NVIDIA → chọn đúng dòng card → tải bản <b>Game Ready</b> hoặc "
+            "<b>Studio</b> mới nhất → cài đặt → khởi động lại máy → mở lại tool.")
+        open_btn = box.addButton("Mở trang tải driver", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("Để sau", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        if box.clickedButton() is open_btn:
+            QDesktopServices.openUrl(QUrl(NVIDIA_DRIVER_URL))
+
     def _ensure_capcut_closed(self, action):
         if is_capcut_running():
             QMessageBox.warning(self, action, "CapCut đang mở. Hãy tắt hẳn CapCut rồi thử lại "

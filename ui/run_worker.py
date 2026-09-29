@@ -10,7 +10,7 @@ from dataclasses import dataclass
 
 from PySide6.QtCore import QThread, Signal
 
-from core import audio, draft_patch, pipeline, segmenter, speech
+from core import audio, draft_patch, logo, parts, pipeline, render, segmenter, speech
 from core.capcut_project import ProjectError, US, is_capcut_running
 
 log = logging.getLogger("run_worker")
@@ -32,7 +32,9 @@ def output_name(video_path: str, language: str) -> str:
 class LanguageJob:
     row: int
     name: str
-    audio_path: str
+    parts: list              # 1 file, hoac cac phan 1.mp3 ... 10.mp3 (da sap thu tu)
+    logo: dict = None        # {"path", "placement"} - chen khi xuat mp4 (draft CapCut khong doi)
+    audio_path: str = ""     # file audio thuc dung: file duy nhat, hoac file gop cac phan
 
 
 @dataclass
@@ -48,12 +50,15 @@ class RunConfig:
     whisper_model: str
     device: str
     languages: list          # [LanguageJob]
+    render_settings: object = None   # core.render.RenderSettings (hop thoai Xuat video)
+    output_paths: dict = None        # {row: duong dan mp4} - ten file do nguoi dung dat
 
 
 class RunWorker(QThread):
     log = Signal(str)
     language_status = Signal(int, str, str)   # row, text, kind (wait/run/ok/warn/error)
     progress = Signal(int)                     # 0-100 toan bo lan chay
+    export_progress = Signal(int, int, str, float)   # row, %, toc do (vd "3.2x"), giay con lai
     finished_all = Signal(int, int, bool)      # so NN ok, so NN loi, draft con cho ap dung
 
     def __init__(self, config: RunConfig, parent=None):
@@ -65,6 +70,8 @@ class RunWorker(QThread):
         self._warned_rows = set()
         self._lang_progress = {}
         self._progress_lock = threading.Lock()
+        self._driver_warned = False
+        self._order = []
 
     def stop(self):
         self._stop = True
@@ -93,7 +100,14 @@ class RunWorker(QThread):
 
         draft = draft_patch.load_draft(cfg.draft_files[0])
         clips = pipeline.read_original_clips(draft, cfg.track_index)
-        durations = [c.target_duration_us / US for c in clips]
+        # Can cau theo THU TU DOC trong file giong goc (co the khac thu tu timeline,
+        # vd cau tieu de doc dau tien nhung keo ra giua video), roi dat lai theo timeline.
+        self._order = pipeline.reading_order(clips)
+        moved = sum(1 for k, i in enumerate(self._order) if k != i)
+        if moved:
+            self.log.emit(f"Track gốc có {moved} câu đặt khác thứ tự đọc (vd câu tiêu đề kéo ra giữa video) "
+                          "→ căn theo thứ tự đọc trong file giọng gốc.")
+        durations = [clips[i].target_duration_us / US for i in self._order]
         timeline_end = int(draft.get("duration", 0)) or (clips[-1].target_start_us + clips[-1].target_duration_us)
         self.log.emit(f"Bắt đầu: {len(cfg.languages)} ngôn ngữ · {len(clips)} câu gốc")
 
@@ -106,12 +120,15 @@ class RunWorker(QThread):
         source_texts = self._original_texts(draft, clips)
         self.progress.emit(8)
 
-        # Chay chong: GPU nhan dang ngon ngu k+1 trong luc CPU/o dia xuat mp4
-        # cua ngon ngu k (luong phu) -> tan dung ca GPU lan CPU cung luc.
+        # Che do "Ca hai": ghi + ap dung DRAFT CapCut TRUOC (mo CapCut kiem tra duoc
+        # ngay), render mp4 SAU. Che do chi xuat mp4: render chong voi nhan dang
+        # ngon ngu tiep theo (GPU nhan dang, CPU/o dia render cung luc).
+        draft_first = uses_draft and uses_export
         self._lang_progress = {job.row: 0.0 for job in cfg.languages}
         export_pool = ThreadPoolExecutor(max_workers=2) if uses_export else None
         done = []      # [(job, placements, audio_duration_us, future_export_hoac_None)]
         err = 0
+        pending_apply = False
         try:
             for job in cfg.languages:
                 if self._stop:
@@ -123,13 +140,23 @@ class RunWorker(QThread):
                     raise
                 except Exception as e:
                     # Loi bat ky (vd GPU het bo nho) chi hong ngon ngu nay, cac ngon ngu khac van chay
-                    if not isinstance(e, (segmenter.SegmentError, audio.AudioError, ProjectError, OSError)):
+                    if not isinstance(e, (segmenter.SegmentError, pipeline.PlacementError, audio.AudioError,
+                                          ProjectError, OSError)):
                         log.exception("Loi khi xu ly %s", job.name)
                     err += 1
                     self._fail(job, e)
                     continue
-                future = export_pool.submit(self._export, job, placements, video_duration) if uses_export else None
+                future = None
+                if uses_export and not draft_first:
+                    future = export_pool.submit(self._export, job, placements, video_duration)
                 done.append((job, placements, dur_us, future))
+
+            if draft_first and done:
+                pending_apply = self._write_draft(draft, [(j, p, d) for j, p, d, _ in done])
+                self.log.emit("Draft CapCut xong — bắt đầu render mp4…")
+                for job, placements, dur_us, _ in done:
+                    self.language_status.emit(job.row, "Đã ghi draft · chờ render", "run")
+                done = [(j, p, d, export_pool.submit(self._export, j, p, video_duration)) for j, p, d, _ in done]
 
             results = []   # [(job, placements, audio_duration_us)]
             for job, placements, dur_us, future in done:
@@ -150,8 +177,7 @@ class RunWorker(QThread):
                 export_pool.shutdown(wait=True, cancel_futures=True)
         ok = len(results)
 
-        pending_apply = False
-        if uses_draft and results:
+        if uses_draft and not draft_first and results:
             pending_apply = self._write_draft(draft, results)
         self.progress.emit(100)
         return ok, err, pending_apply
@@ -160,11 +186,32 @@ class RunWorker(QThread):
     def _original_texts(self, draft, clips):
         """Noi dung cau goc de so nghia: uu tien phu de, roi toi nhan dang giong goc."""
         texts, cover = pipeline.subtitle_texts(draft, clips)
-        if cover >= MIN_SUBTITLE_COVER:
-            self.log.emit(f"Nội dung câu gốc: lấy từ track phụ đề ({cover:.0%} câu có phụ đề).")
+        if cover >= 1.0:
+            self.log.emit("Nội dung câu gốc: lấy từ track phụ đề (100% câu có phụ đề).")
             return texts
-        self.log.emit(f"Phụ đề chỉ phủ {cover:.0%} câu → nhận dạng giọng gốc để lấy nội dung câu.")
-        search_roots = [os.path.dirname(self.config.project_dir), self.config.project_dir]
+        missing = [i + 1 for i, t in enumerate(texts) if not t]
+        voice = self._original_voice_texts(clips)
+        if cover >= MIN_SUBTITLE_COVER:
+            if voice:
+                # Doan khong co phu de (vd cau tieu de nam o track chu khac) -> lay tu giong goc
+                texts = [t or v for t, v in zip(texts, voice)]
+                self.log.emit(f"Nội dung câu gốc: phụ đề ({cover:.0%}), {len(missing)} câu không có phụ đề "
+                              f"(câu {', '.join(map(str, missing[:6]))}) lấy từ giọng gốc.")
+            else:
+                self.log.emit(f"Nội dung câu gốc: phụ đề ({cover:.0%}); {len(missing)} câu không có phụ đề "
+                              "và không tìm thấy file giọng gốc để bù.")
+            return texts
+        if voice:
+            self.log.emit(f"Phụ đề chỉ phủ {cover:.0%} câu → dùng nội dung nhận dạng từ giọng gốc.")
+            return voice
+        self.log.emit("Không có phụ đề đủ và không tìm thấy file giọng gốc → chỉ căn theo độ dài câu "
+                      "(kém chính xác hơn).")
+        return None
+
+    def _original_voice_texts(self, clips):
+        """Noi dung tung cau goc nhan dang tu file giong goc (theo source_timerange). None neu khong co file."""
+        # Tim trong project truoc; thu muc cha (vd CapCut Drafts chua ca tram project) sau cung
+        search_roots = [self.config.project_dir, os.path.dirname(self.config.project_dir)]
         sources = pipeline.resolve_original_sources(clips, search_roots)
         words_by_file = {}
         for path in sorted({p for p in sources.values() if p}):
@@ -173,7 +220,6 @@ class RunWorker(QThread):
             words_by_file[path] = words
             self.log.emit(f"Đã nhận dạng giọng gốc {os.path.basename(path)} ({lang}).")
         if not words_by_file:
-            self.log.emit("Không tìm thấy file giọng gốc → chỉ căn theo độ dài câu (kém chính xác hơn).")
             return None
         return pipeline.original_texts(clips, sources, words_by_file)
 
@@ -198,6 +244,13 @@ class RunWorker(QThread):
     def _process_language(self, job, clips, durations, timeline_end, source_texts, share):
         """share: phan tien do cua ngon ngu nay danh cho buoc nay (phan con lai la xuat mp4)."""
         cfg = self.config
+        if len(job.parts) > 1:
+            self.language_status.emit(job.row, f"Ghép {len(job.parts)} phần…", "run")
+            job.audio_path, reused = parts.merge_parts(job.parts, job.name)
+            self.log.emit(f"[{job.name}] {'Dùng lại' if reused else 'Đã ghép'} {len(job.parts)} phần → "
+                          f"{os.path.basename(job.audio_path)}")
+        else:
+            job.audio_path = job.parts[0]
         self.language_status.emit(job.row, "Nhận dạng giọng nói…", "run")
 
         def on_progress(p):
@@ -215,14 +268,33 @@ class RunWorker(QThread):
 
         self.language_status.emit(job.row, "Đang tách câu…", "run")
         silences = audio.detect_silences(job.audio_path)
-        result = segmenter.split_sentences(words, durations, silences, dur, source_texts,
-                                           self._embed() if source_texts else None)
+        texts_in_order = [source_texts[i] for i in self._order] if source_texts else None
+        result = segmenter.split_sentences(words, durations, silences, dur, texts_in_order,
+                                           self._embed() if source_texts else None,
+                                           labels=[i + 1 for i in self._order],
+                                           pair_gaps=self._pair_gaps(clips))
         self._set_progress(job, share)
-        placements, truncated = pipeline.compute_placements(result.sentences, clips, timeline_end)
-        self.log.emit(f"[{job.name}] Tách {len(result.sentences)}/{len(clips)} câu · độ khớp {result.correlation:.2f}"
-                      f" · {truncated} câu cắt đuôi · 0 chồng tiếng")
-        for w in result.warnings:
+        # Cau thu k (thu tu doc) thuoc ve clip self._order[k] -> xep lai theo timeline
+        by_clip = [None] * len(clips)
+        for k, i in enumerate(self._order):
+            by_clip[i] = result.sentences[k]
+        placements, report = pipeline.compute_placements(by_clip, clips, timeline_end)
+        for first, second in result.merged:
+            self.log.emit(f"[{job.name}] Câu {first} + {second} được đọc liền thành 1 câu → đặt ở vị trí câu "
+                          f"{first}, câu {second} không có tiếng riêng.")
+        self.log.emit(f"[{job.name}] Tách {len(placements)}/{len(clips)} câu"
+                      + (f" ({len(result.merged)} cặp đọc liền)" if result.merged else "")
+                      + f" · độ khớp {result.correlation:.2f}"
+                      f" · {report.pushed_later} câu đẩy ra sau · {report.pulled_earlier} câu kéo sớm lên"
+                      f" · 0 chồng tiếng · không cắt câu nào")
+        warnings = list(result.warnings)
+        if report.far:
+            detail = ", ".join(f"câu {i} ({d:+.1f}s)" for i, d in report.far[:8])
+            more = f" và {len(report.far) - 8} câu khác" if len(report.far) > 8 else ""
+            warnings.append(f"{len(report.far)} câu lệch mốc gốc hơn 5 giây: {detail}{more} — nên nghe kiểm tra.")
+        for w in warnings:
             self.log.emit(f"[{job.name}] Cảnh báo: {w}")
+        result.warnings = warnings
         if result.warnings:
             self._warned_rows.add(job.row)
         status_kind = "warn" if result.warnings else "ok"
@@ -233,7 +305,9 @@ class RunWorker(QThread):
     def _export(self, job, placements, video_duration):
         """Chay o luong phu (song song voi nhan dang ngon ngu tiep theo)."""
         cfg = self.config
-        out_path = os.path.join(cfg.output_dir, output_name(cfg.video_path, job.name))
+        out_path = (cfg.output_paths or {}).get(job.row) or \
+            os.path.join(cfg.output_dir, output_name(cfg.video_path, job.name))
+        settings = cfg.render_settings or render.RECOMMENDED
         self.language_status.emit(job.row, "Đang dựng audio…", "run")
         fd, wav = tempfile.mkstemp(suffix=".wav")
         os.close(fd)
@@ -241,11 +315,16 @@ class RunWorker(QThread):
             audio.build_dub_wav(job.audio_path, [(t / US, s / US, d / US) for t, s, d in placements],
                                 video_duration, wav)
 
-            def on_progress(p):
-                self.language_status.emit(job.row, f"Đang export {p}%", "run")
+            def on_progress(p, speed, eta):
+                self.language_status.emit(job.row, f"Đang render {p}%", "run")
+                self.export_progress.emit(job.row, p, speed, float(eta))
                 self._set_progress(job, 0.6 + 0.4 * p / 100)
 
-            audio.mux_video(cfg.video_path, wav, out_path, on_progress, self._stopped)
+            logo_png, geo_for = self._logo_for(job)
+            if logo_png:
+                self._warn_old_nvidia_driver()
+            how = render.render(cfg.video_path, wav, out_path, settings, logo_png, geo_for, on_progress,
+                                self._stopped, on_log=lambda m: self.log.emit(f"[{job.name}] {m}"))
         finally:
             try:
                 os.remove(wav)
@@ -254,7 +333,41 @@ class RunWorker(QThread):
         warned = job.row in self._warned_rows
         self.language_status.emit(job.row, "Xong · có cảnh báo" if warned else "Xong · đã xuất mp4",
                                   "warn" if warned else "ok")
-        self.log.emit(f"[{job.name}] Xuất {out_path}")
+        self.log.emit(f"[{job.name}] Xuất {out_path} ({how})")
+
+    def _pair_gaps(self, clips):
+        """Khoang cach tren timeline (giay) giua 2 cau goc lien nhau theo thu tu doc.
+        Cau sau khong nam ngay sau tren timeline -> coi nhu rat xa (khong nen gop)."""
+        gaps = []
+        for i, j in zip(self._order, self._order[1:]):
+            if j != i + 1:
+                gaps.append(segmenter.MERGE_FAR_GAP)
+            else:
+                end_i = clips[i].target_start_us + clips[i].target_duration_us
+                gaps.append(max(0.0, (clips[j].target_start_us - end_i) / US))
+        return gaps
+
+    def _warn_old_nvidia_driver(self):
+        """Xuat video co logo ma card roi NVIDIA khong dung duoc do driver cu -> nhac 1 lan/luot chay."""
+        with self._progress_lock:
+            if self._driver_warned:
+                return
+            self._driver_warned = True
+        from core.encoder import nvidia_status
+        status = nvidia_status()
+        if status.needs_update:
+            self.log.emit("⚠ " + status.message())
+
+    def _logo_for(self, job):
+        """(png da xu ly, ham (w, h video DICH) -> (x, y, w, h) pixel) hoac ('', None)."""
+        if not job.logo or not job.logo.get("path"):
+            return "", None
+        from PySide6.QtGui import QImage
+        placement = logo.LogoPlacement.from_dict(job.logo.get("placement"))
+        png = logo.prepared_logo_png(job.logo["path"], placement.remove_bg)
+        img = QImage(png)
+        # Vi tri luu theo TI LE khung hinh -> tinh theo do phan giai xuat (co the khac video goc)
+        return png, lambda vw, vh: logo.overlay_geometry(placement, img.width(), img.height(), vw, vh)
 
     def _write_draft(self, draft, results) -> bool:
         """Tra ve True neu da ghi ket qua nhung CHUA ap dung (CapCut dang mo)."""

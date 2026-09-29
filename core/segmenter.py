@@ -1,4 +1,4 @@
-"""Tach audio ngon ngu dich thanh DUNG N cau, dung thu tu, khop voi N cau goc.
+﻿"""Tach audio ngon ngu dich thanh DUNG N cau, dung thu tu, khop voi N cau goc.
 
 Van de: file doc lien mach co hang tram cho ngat dai gan bang nhau, va track
 goc thuong bi cat GIUA cau (tai cho nguoi doc ban goc ngung) -> khong the chi
@@ -19,11 +19,14 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-SENTENCE_END_RE = re.compile(r"[.!?。！？…]+[\"'”’»)\]]*$")
+SENTENCE_END_RE = re.compile(r"[.!?ã€‚ï¼ï¼Ÿâ€¦]+[\"'â€â€™Â»)\]]*$")
 
 MIN_PAUSE = 0.12          # cho ngat ngan hon muc nay khong lam ranh gioi (giay)
 MAX_UNITS = 16            # 1 cau toi da trai qua bao nhieu doan giua 2 cho ngat
 REFINE_RADIUS = 1         # buoc so nghia chinh xac: xe dich moi ranh gioi +-1 cho ngat
+MERGE_PENALTY = 2.0       # phat khi gop 2 cau goc vao 1 doan (chi gop khi ro rang tot hon)
+MERGE_GAP_WEIGHT = 1.5    # + phat moi giay 2 cau goc cach nhau tren timeline (gop -> cau sau phat som hon hinh)
+MERGE_FAR_GAP = 10.0      # cau sau KHONG nam ngay sau tren timeline -> coi nhu cach xa 10s
 LOG_RATIO_SIGMA = 0.35    # do lech do dai chap nhan (log ti le)
 SIM_WEIGHT = 12.0         # trong so do giong nghia
 PAUSE_WEIGHT = 1.0        # diem moi giay ngat o ranh gioi
@@ -53,11 +56,12 @@ class Sentence:
 
 @dataclass
 class SegmentResult:
-    sentences: list
+    sentences: list                 # dung N phan tu; None = cau goc da gop vao cau truoc (can 2:1)
     correlation: float
     speed_ratio: float
     used_meaning: bool
     warnings: list = field(default_factory=list)
+    merged: list = field(default_factory=list)   # [(nhan cau dau, nhan cau bi gop)]
 
 
 def _speech_bounds(words, silences, duration):
@@ -71,7 +75,10 @@ def _speech_bounds(words, silences, duration):
 
 
 def _candidates(words, silences, t0, t1):
-    """Cac cho ngat trong audio: (het tieng, bat dau tieng lai, diem thuong)."""
+    """Cac cho ngat trong audio: (het tieng, bat dau tieng lai, diem thuong).
+    Nguon 1: khoang lang do duoc (ffmpeg). Nguon 2: DAU CHAM CAU whisper nhan ra
+    ma khoang ngat qua ngan de do duoc (vd "â€¦em silÃªncio total. Elas caÃ§amâ€¦") -
+    thieu cho cat nay thi 2 cau bi gop nham, cau sau phat som hon hinh."""
     cands = []
     wi = 0
     for s, e in silences:
@@ -81,23 +88,42 @@ def _candidates(words, silences, t0, t1):
             wi += 1
         punct = words[wi].end <= s + 0.35 and bool(SENTENCE_END_RE.search(words[wi].text.strip()))
         cands.append((s, e, PAUSE_WEIGHT * (e - s) + (PUNCT_BONUS if punct else 0.0)))
-    return cands
+
+    covered = sorted(cands)
+    extra = []
+    for w, nxt in zip(words, words[1:]):
+        if not SENTENCE_END_RE.search(w.text.strip()) or w.end <= t0 or nxt.start >= t1:
+            continue
+        # da co khoang lang do duoc ngay cho nay -> khong them trung
+        if any(s - 0.35 <= w.end <= e + 0.35 for s, e, _ in covered):
+            continue
+        end, start = w.end, max(w.end, nxt.start)
+        extra.append((end, start, PAUSE_WEIGHT * (start - end) + PUNCT_BONUS))
+    return sorted(cands + extra)
 
 
 def split_sentences(words, original_durations, silences, audio_duration,
-                    original_texts=None, embedder=None, on_log=None) -> SegmentResult:
+                    original_texts=None, embedder=None, on_log=None, labels=None,
+                    pair_gaps=None) -> SegmentResult:
+    """labels: so thu tu hien thi cua tung cau trong canh bao (vd so thu tu tren
+    timeline khi cau duoc can theo thu tu doc). Mac dinh 1..N.
+    pair_gaps[k]: khoang cach tren timeline (giay) giua cau goc k va k+1 (thu tu doc)
+    - dung de phat viec gop 2 cau cach xa nhau."""
     n = len(original_durations)
+    labels = labels or list(range(1, n + 1))
+    merge_cost = [MERGE_PENALTY + MERGE_GAP_WEIGHT * min(MERGE_FAR_GAP, max(0.0, g))
+                  for g in (pair_gaps or [0.0] * max(0, n - 1))]
     words = [w for w in words if w.text.strip()]
     if n <= 0:
-        raise SegmentError("Track gốc không có câu nào.")
+        raise SegmentError("Track gá»‘c khÃ´ng cÃ³ cÃ¢u nÃ o.")
     if not words:
-        raise SegmentError("Không nhận dạng được giọng nói nào trong file audio.")
+        raise SegmentError("KhÃ´ng nháº­n dáº¡ng Ä‘Æ°á»£c giá»ng nÃ³i nÃ o trong file audio.")
 
     t0, t1 = _speech_bounds(words, silences, audio_duration)
     cands = _candidates(words, silences, t0, t1)
     if len(cands) < n - 1:
-        raise SegmentError(f"Chỉ tìm được {len(cands)} chỗ ngắt nghỉ, cần ít nhất {n - 1} để tách {n} câu. "
-                           "Audio này có thể thiếu câu hoặc đọc quá liền mạch.")
+        raise SegmentError(f"Chá»‰ tÃ¬m Ä‘Æ°á»£c {len(cands)} chá»— ngáº¯t nghá»‰, cáº§n Ã­t nháº¥t {n - 1} Ä‘á»ƒ tÃ¡ch {n} cÃ¢u. "
+                           "Audio nÃ y cÃ³ thá»ƒ thiáº¿u cÃ¢u hoáº·c Ä‘á»c quÃ¡ liá»n máº¡ch.")
 
     node_start = [t0] + [c[1] for c in cands] + [t1]     # tieng bat dau sau node
     node_end = [t0] + [c[0] for c in cands] + [t1]       # tieng ket thuc tai node
@@ -113,7 +139,7 @@ def split_sentences(words, original_durations, silences, audio_duration,
     max_len = 1.8 * ratio * max(original_durations)
     spans = [(a, b) for a in range(last_node) for b in range(a + 1, min(last_node, a + MAX_UNITS) + 1)
              if node_end[b] - node_start[a] <= max_len]
-    sim = None
+    sim = sim2 = None
     use_meaning = bool(original_texts) and embedder is not None and len(original_texts) == n
     if use_meaning:
         mids = np.array([(w.start + w.end) / 2 for w in words])
@@ -122,7 +148,11 @@ def split_sentences(words, original_durations, silences, audio_duration,
             lo, hi = np.searchsorted(mids, node_start[a] - 0.1), np.searchsorted(mids, node_end[b] + 0.1)
             return "".join(w.text for w in words[lo:hi]).strip()
 
-        orig_vec = embedder.encode(list(original_texts))
+        texts = list(original_texts)
+        orig_vec = embedder.encode(texts)
+        # 2 cau goc LIEN NHAU (theo thu tu doc) ma ban dich doc lien thanh 1 cau
+        # (vd "Leones del Serengeti." + "Â¿ReinarÃ¡n o caerÃ¡n?") -> can 2:1
+        pair_vec = embedder.encode([f"{texts[k]} {texts[k + 1]}" for k in range(n - 1)]) if n > 1 else None
         # Buoc 1 (nhanh): vector moi doan nho giua 2 cho ngat, vector doan dai =
         # ghep cac doan nho (tong token / so token) -> chi chay model ~vai tram lan.
         sums, counts = embedder.encode_token_sums([span_text(u, u + 1) for u in range(last_node)])
@@ -132,119 +162,159 @@ def split_sentences(words, original_durations, silences, audio_duration,
         b_idx = np.array([b for _, b in spans])
         vec = (csum[b_idx] - csum[a_idx]) / np.maximum(ccount[b_idx] - ccount[a_idx], 1)[:, None]
         vec /= np.maximum(np.linalg.norm(vec, axis=1, keepdims=True), 1e-9)
-        coarse = vec @ orig_vec.T
+        coarse, coarse2 = vec @ orig_vec.T, (vec @ pair_vec.T if pair_vec is not None else None)
         sim = {span: coarse[k] for k, span in enumerate(spans)}
-        path = _align_iter(n, node_start, node_end, node_score, original_durations, ratio, sim, orig_total)
+        sim2 = {span: coarse2[k] for k, span in enumerate(spans)} if coarse2 is not None else None
+        steps = _align_iter(n, node_start, node_end, node_score, original_durations, ratio, sim, sim2, orig_total, merge_cost)
 
         # Buoc 2 (chinh xac): chay model tren nguyen doan cho cac cach cat lan
         # can phuong an buoc 1 (moi ranh gioi xe dich +-1 cho ngat), chon lai.
-        if path is not None:
+        if steps is not None:
             near = []
-            for a0, b0 in zip(path, path[1:]):
+            for a0, b0, _, _ in steps:
                 for a in range(a0 - REFINE_RADIUS, a0 + REFINE_RADIUS + 1):
                     for b in range(b0 - REFINE_RADIUS, b0 + REFINE_RADIUS + 1):
                         if 0 <= a < b <= last_node and (a == 0) == (a0 == 0) and (b == last_node) == (b0 == last_node):
                             near.append((a, b))
             near = sorted(set(near))
             if on_log:
-                on_log(f"So nghĩa chính xác {len(near)} cách cắt…")
-            exact = embedder.encode([span_text(a, b) for a, b in near]) @ orig_vec.T
-            sim = {span: exact[k] for k, span in enumerate(near)}
-            refined = _align_iter(n, node_start, node_end, node_score, original_durations, ratio, sim, orig_total)
+                on_log(f"So nghÄ©a chÃ­nh xÃ¡c {len(near)} cÃ¡ch cáº¯tâ€¦")
+            near_vec = embedder.encode([span_text(a, b) for a, b in near])
+            exact = near_vec @ orig_vec.T
+            exact2 = near_vec @ pair_vec.T if pair_vec is not None else None
+            fine = {span: exact[k] for k, span in enumerate(near)}
+            fine2 = {span: exact2[k] for k, span in enumerate(near)} if exact2 is not None else None
+            refined = _align_iter(n, node_start, node_end, node_score, original_durations, ratio,
+                                  fine, fine2, orig_total, merge_cost)
             if refined is not None:
-                path = refined
-            else:
-                sim = {span: coarse[k] for k, span in enumerate(spans)}
+                steps, sim, sim2 = refined, fine, fine2
     else:
-        path = _align_iter(n, node_start, node_end, node_score, original_durations, ratio, None, orig_total)
-    if path is None:
-        raise SegmentError("Không căn được câu mới với câu gốc (độ dài quá chênh lệch). "
-                           "Kiểm tra audio có đúng kịch bản của project này không.")
-    ratio = sum(node_end[b] - node_start[a] for a, b in zip(path, path[1:])) / orig_total
+        steps = _align_iter(n, node_start, node_end, node_score, original_durations, ratio, None, None, orig_total, merge_cost)
+    if steps is None:
+        raise SegmentError("KhÃ´ng cÄƒn Ä‘Æ°á»£c cÃ¢u má»›i vá»›i cÃ¢u gá»‘c (Ä‘á»™ dÃ i quÃ¡ chÃªnh lá»‡ch). "
+                           "Kiá»ƒm tra audio cÃ³ Ä‘Ãºng ká»‹ch báº£n cá»§a project nÃ y khÃ´ng.")
+    ratio = sum(node_end[b] - node_start[a] for a, b, _, _ in steps) / orig_total
 
-    sentences = []
-    for i, (a, b) in enumerate(zip(path, path[1:])):
+    # sentences[k] = cau moi cua cau goc k; cau goc duoc GOP vao cau truoc -> None
+    sentences = [None] * n
+    expected = [0.0] * n            # do dai goc tuong ung (cong ca cau bi gop)
+    merged = []
+    for a, b, k, step in steps:
         s, e = node_start[a], node_end[b]
         text = "".join(w.text for w in words if s - 0.3 <= (w.start + w.end) / 2 <= e + 0.1).strip()
-        similarity = float(sim[(a, b)][i]) if sim else 0.0
-        sentences.append(Sentence(max(0.0, s - PAD_BEFORE), min(audio_duration, e + PAD_AFTER), text, similarity))
-    for x, y in zip(sentences, sentences[1:]):
-        if x.end > y.start:
-            x.end = y.start = (x.end + y.start) / 2
+        table = sim if step == 1 else sim2
+        similarity = float(table[(a, b)][k]) if table else 0.0
+        sentences[k] = Sentence(max(0.0, s - PAD_BEFORE), min(audio_duration, e + PAD_AFTER), text, similarity)
+        expected[k] = sum(original_durations[k:k + step])
+        if step == 2:
+            merged.append((labels[k], labels[k + 1]))
+    present = [k for k in range(n) if sentences[k] is not None]
+    for x, y in zip(present, present[1:]):
+        if sentences[x].end > sentences[y].start:
+            sentences[x].end = sentences[y].start = (sentences[x].end + sentences[y].start) / 2
 
     if use_meaning:
-        low = [i + 1 for i, s in enumerate(sentences) if s.similarity < LOW_SIMILARITY]
+        low = sorted(labels[k] for k in present if sentences[k].similarity < LOW_SIMILARITY)
         if len(low) > MAX_LOW_SIMILARITY_SHARE * n:
             raise SegmentError(
-                f"{len(low)}/{n} câu có nội dung không khớp câu gốc (vd câu {', '.join(map(str, low[:5]))}). "
-                "Audio này có thể thiếu/thừa câu hoặc không cùng kịch bản.")
-    corr = duration_correlation(sentences, original_durations)
+                f"{len(low)}/{n} cÃ¢u cÃ³ ná»™i dung khÃ´ng khá»›p cÃ¢u gá»‘c (vd cÃ¢u {', '.join(map(str, low[:5]))}). "
+                "Audio nÃ y cÃ³ thá»ƒ thiáº¿u/thá»«a cÃ¢u hoáº·c khÃ´ng cÃ¹ng ká»‹ch báº£n.")
+    corr = _correlation([sentences[k].end - sentences[k].start for k in present], [expected[k] for k in present])
     if corr < MIN_CORRELATION:
-        raise SegmentError(f"Độ khớp độ dài câu mới với câu gốc quá thấp ({corr:.2f}). "
-                           "Audio này có thể không cùng kịch bản, hoặc thiếu/thừa câu.")
+        raise SegmentError(f"Äá»™ khá»›p Ä‘á»™ dÃ i cÃ¢u má»›i vá»›i cÃ¢u gá»‘c quÃ¡ tháº¥p ({corr:.2f}). "
+                           "Audio nÃ y cÃ³ thá»ƒ khÃ´ng cÃ¹ng ká»‹ch báº£n, hoáº·c thiáº¿u/thá»«a cÃ¢u.")
     warnings = []
     if not use_meaning:
-        warnings.append("Không có nội dung câu gốc → chỉ căn theo độ dài, có thể lệch ở đoạn cắt giữa câu. "
-                        "Nên mở CapCut nghe kiểm tra.")
+        warnings.append("KhÃ´ng cÃ³ ná»™i dung cÃ¢u gá»‘c â†’ chá»‰ cÄƒn theo Ä‘á»™ dÃ i, cÃ³ thá»ƒ lá»‡ch á»Ÿ Ä‘oáº¡n cáº¯t giá»¯a cÃ¢u. "
+                        "NÃªn má»Ÿ CapCut nghe kiá»ƒm tra.")
     if corr < WARN_CORRELATION:
-        warnings.append(f"Độ khớp độ dài câu chỉ {corr:.2f} — nên mở CapCut nghe kiểm tra.")
-    for i, (sent, od) in enumerate(zip(sentences, original_durations)):
+        warnings.append(f"Äá»™ khá»›p Ä‘á»™ dÃ i cÃ¢u chá»‰ {corr:.2f} â€” nÃªn má»Ÿ CapCut nghe kiá»ƒm tra.")
+    for k in present:
+        sent, od = sentences[k], expected[k]
         if use_meaning and sent.similarity < LOW_SIMILARITY:
-            warnings.append(f"Câu {i + 1}: nội dung ít giống câu gốc ({sent.similarity:.2f}) — nên nghe kiểm tra.")
+            warnings.append(f"CÃ¢u {labels[k]}: ná»™i dung Ã­t giá»‘ng cÃ¢u gá»‘c ({sent.similarity:.2f}) â€” nÃªn nghe kiá»ƒm tra.")
         elif abs(math.log(max(0.05, sent.end - sent.start) / (ratio * od))) > OUTLIER_LOG_RATIO:
-            warnings.append(f"Câu {i + 1} dài {sent.end - sent.start:.1f}s, lệch nhiều so với câu gốc "
-                            f"({od:.1f}s) — nên nghe kiểm tra.")
-    return SegmentResult(sentences, corr, ratio, use_meaning, warnings)
+            warnings.append(f"CÃ¢u {labels[k]} dÃ i {sent.end - sent.start:.1f}s, lá»‡ch nhiá»u so vá»›i cÃ¢u gá»‘c "
+                            f"({od:.1f}s) â€” nÃªn nghe kiá»ƒm tra.")
+    return SegmentResult(sentences, corr, ratio, use_meaning, warnings, merged)
 
 
-def _align_iter(n, node_start, node_end, node_score, original_durations, ratio, sim, orig_total):
+def _align_iter(n, node_start, node_end, node_score, original_durations, ratio, sim, sim2, orig_total, merge_cost):
     """Chay DP 2 lan: lan 2 dung ti le toc do tinh lai tu ket qua lan 1."""
-    path = None
+    steps = None
     for _ in range(2):
-        path = _align(n, node_start, node_end, node_score, original_durations, ratio, sim)
-        if path is None:
+        steps = _align(n, node_start, node_end, node_score, original_durations, ratio, sim, sim2, merge_cost)
+        if steps is None:
             return None
-        ratio = sum(node_end[b] - node_start[a] for a, b in zip(path, path[1:])) / orig_total
-    return path
+        ratio = sum(node_end[b] - node_start[a] for a, b, _, _ in steps) / orig_total
+    return steps
 
 
-def _align(n, node_start, node_end, node_score, original_durations, ratio, sim):
-    """Quy hoach dong: tra ve [0, b1, ..., b_{n-1}, node_cuoi] hoac None."""
+def _align(n, node_start, node_end, node_score, original_durations, ratio, sim, sim2, merge_cost):
+    """Quy hoach dong. Moi buoc = 1 doan audio moi (node a -> node b) phu:
+      - 1 cau goc (binh thuong), hoac
+      - 2 cau goc LIEN NHAU (can 2:1, chi khi co so nghia): ban dich doc lien 2 cau.
+    Tra ve [(a, b, cau_goc_dau, so_cau_goc)] hoac None."""
     last_node = len(node_start) - 1
     INF = float("inf")
-    prev = {0: (0.0, None)}
-    back = []
-    for i in range(n):
-        expected = ratio * original_durations[i]
+    costs = [{0: (0.0, None, 0)}]          # costs[i][node] = (chi phi, node truoc, so cau goc cua buoc)
+    for i in range(1, n + 1):
         cur = {}
-        remaining = n - 1 - i
-        targets = [last_node] if remaining == 0 else range(1, last_node - remaining + 1)
-        for b in targets:
-            best, arg = INF, None
-            for a in range(max(0, b - MAX_UNITS), b):
-                if a not in prev:
-                    continue
-                length = node_end[b] - node_start[a]
-                if length <= 0.2 or (sim is not None and (a, b) not in sim):
-                    continue
-                dev = math.log(length / expected) / LOG_RATIO_SIGMA
-                cost = prev[a][0] + 0.5 * dev * dev - node_score[b]
-                if sim is not None:
-                    cost -= SIM_WEIGHT * float(sim[(a, b)][i])
-                if cost < best:
-                    best, arg = cost, a
-            if arg is not None:
-                cur[b] = (best, arg)
+        targets = [last_node] if i == n else range(1, last_node)
+        for step in (1, 2):
+            if i - step < 0 or (step == 2 and sim2 is None):
+                continue
+            prev = costs[i - step]
+            if not prev:
+                continue
+            k = i - step
+            expected = ratio * sum(original_durations[k:i])
+            table = sim if step == 1 else sim2
+            for b in targets:
+                best = cur.get(b, (INF,))[0]
+                for a in range(max(0, b - MAX_UNITS), b):
+                    pa = prev.get(a)
+                    if pa is None:
+                        continue
+                    length = node_end[b] - node_start[a]
+                    if length <= 0.2:
+                        continue
+                    if table is not None:
+                        v = table.get((a, b))
+                        if v is None:
+                            continue
+                    dev = math.log(length / expected) / LOG_RATIO_SIGMA
+                    cost = pa[0] + 0.5 * dev * dev - node_score[b]
+                    if table is not None:
+                        # doan gop phu 2 cau goc -> tinh diem nghia cho ca 2 (so sanh cong bang voi tach rieng)
+                        cost -= SIM_WEIGHT * float(v[k]) * step
+                    if step == 2:
+                        cost += merge_cost[k]
+                    if cost < best:
+                        best = cost
+                        cur[b] = (cost, a, step)
         if not cur:
             return None
-        back.append(cur)
-        prev = cur
-    if last_node not in prev:
+        costs.append(cur)
+    if last_node not in costs[n]:
         return None
-    path = [last_node]
-    for i in range(n - 1, -1, -1):
-        path.append(back[i][path[-1]][1])
-    return list(reversed(path))
+    steps, i, b = [], n, last_node
+    while i > 0:
+        _, a, step = costs[i][b]
+        steps.append((a, b, i - step, step))
+        i, b = i - step, a
+    return list(reversed(steps))
+
+
+def _correlation(a, b) -> float:
+    n = len(a)
+    if n < 3 or n != len(b):
+        return 1.0
+    ma, mb = sum(a) / n, sum(b) / n
+    cov = sum((x - ma) * (y - mb) for x, y in zip(a, b))
+    va = sum((x - ma) ** 2 for x in a) ** 0.5
+    vb = sum((y - mb) ** 2 for y in b) ** 0.5
+    return cov / (va * vb) if va and vb else 1.0
 
 
 def duration_correlation(sentences, original_durations) -> float:

@@ -42,6 +42,18 @@ def _walk_limited(root, depth):
         yield dirpath, filenames
 
 
+def reading_order(clips: list) -> list:
+    """Thu tu DOC cua cac cau trong file giong goc (vi tri source_timerange) - co
+    the KHAC thu tu tren timeline (vd cau tieu de doc dau tien nhung duoc keo ra
+    giua video). Audio ngon ngu moi doc theo cung kich ban -> cung thu tu DOC nay.
+    Nhieu file nguon: file nao xuat hien som tren timeline truoc, trong file theo vi tri.
+    Tra ve danh sach chi so clip (theo timeline) xep theo thu tu doc."""
+    first_seen = {}
+    for i, c in enumerate(clips):
+        first_seen.setdefault(c.source_path, i)
+    return sorted(range(len(clips)), key=lambda i: (first_seen[clips[i].source_path], clips[i].source_start_us, i))
+
+
 def resolve_media(path_in_draft: str, search_roots: list) -> str:
     """Duong dan trong draft hay bi cu (project da chuyen o dia/may). Tim lai
     file cung ten trong thu muc project."""
@@ -130,22 +142,64 @@ def _clip_at(clips, t_us):
     return lo
 
 
+FAR_SHIFT_US = 5 * US    # cau bi dich xa moc goc hon muc nay -> canh bao
+
+
+class PlacementError(Exception):
+    pass
+
+
+@dataclass
+class PlacementReport:
+    pushed_later: int = 0          # TH1: so cau bi day ra sau
+    pulled_earlier: int = 0        # TH2: so cau bi keo som len
+    far: list = None               # [(so_thu_tu_cau, lech_giay)] lech > 5s
+
+
 def compute_placements(sentences: list, clips: list, timeline_end_us: int) -> tuple:
-    """Moi cau moi dat dung moc bat dau cau goc; dai qua khoang trong toi cau ke
-    tiep thi CAT DUOI (khong bao gio chong 2 giong).
-    Tra ve ([(target_us, source_us, duration_us)], so_cau_bi_cat_duoi)."""
+    """Dat cau moi i vao moc bat dau cau goc i. KHONG BAO GIO CAT CAU, khong doi toc do;
+    tranh 2 giong de nhau bang cach DICH VI TRI (quy tac da chot voi nguoi dung 2026-09-29):
+      TH1: cau truoc dai de sang cau sau -> cau sau bat dau NOI SAT ngay khi cau truoc
+           het, day day chuyen ra sau.
+      TH2: cau cuoi vuot qua cuoi video -> keo som len de ket thuc DUNG cuoi video, cau
+           nao bi de thi keo som len theo, day chuyen nguoc ve truoc.
+      Tong giong dai hon ca video -> PlacementError (bao loi ngon ngu do).
+    Tra ve ([(target_us, source_us, duration_us)], PlacementReport)."""
+    # Cau goc da GOP vao cau truoc (None, can 2:1) -> khong co doan rieng tren timeline
+    idx = [i for i, s in enumerate(sentences[:len(clips)]) if s is not None]
+    sentences = [sentences[i] for i in idx]
+    n = len(sentences)
+    lengths = [max(1, int(round((s.end - s.start) * US))) for s in sentences]
+    origin = [clips[i].target_start_us for i in idx]
+    starts = list(origin)
+
+    # TH1: quet tu dau -> cuoi, day cau bi de ra sau
+    for i in range(1, n):
+        starts[i] = max(origin[i], starts[i - 1] + lengths[i - 1])
+
+    # TH2: quet tu cuoi -> dau, keo cau vuot cuoi video (va cau bi de) som len
+    if n and starts[-1] + lengths[-1] > timeline_end_us:
+        starts[-1] = timeline_end_us - lengths[-1]
+        for i in range(n - 2, -1, -1):
+            if starts[i] + lengths[i] > starts[i + 1]:
+                starts[i] = starts[i + 1] - lengths[i]
+    if n and starts[0] < 0:
+        over = -starts[0] / US
+        raise PlacementError(f"Tổng giọng mới dài hơn video {over:.1f}s — không xếp được mà không chồng tiếng. "
+                             "Kiểm tra lại audio (thừa phần/ thừa câu?).")
+
+    report = PlacementReport(far=[])
     placements = []
-    truncated = 0
-    for i, (sent, clip) in enumerate(zip(sentences, clips)):
-        next_start = clips[i + 1].target_start_us if i + 1 < len(clips) else timeline_end_us
-        room = max(0, next_start - clip.target_start_us)
-        length = int(round((sent.end - sent.start) * US))
-        if length > room:
-            truncated += 1
-            length = room
-        if length > 0:
-            placements.append((clip.target_start_us, int(round(sent.start * US)), length))
-    return placements, truncated
+    for i in range(n):
+        delta = starts[i] - origin[i]
+        if delta > 0:
+            report.pushed_later += 1
+        elif delta < 0:
+            report.pulled_earlier += 1
+        if abs(delta) > FAR_SHIFT_US:
+            report.far.append((idx[i] + 1, delta / US))
+        placements.append((starts[i], int(round(sentences[i].start * US)), lengths[i]))
+    return placements, report
 
 
 def is_audio_file(path: str) -> bool:

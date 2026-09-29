@@ -4,8 +4,10 @@
   CHUNG 1 material (giong cach CapCut tu lam voi track goc).
 - Moi segment moi co du 6 extra_material_refs (speed, placeholder_info, beats,
   sound_channel_mapping, loudness, vocal_separation) nhan ban tu segment goc, doi id.
-- Track goc: volume = 0 tung segment (giu last_nonzero_volume de bat lai), KHONG xoa.
-- Chi 1 ngon ngu duoc bat tieng, cac ngon ngu con lai volume = 0.
+- Track goc: tat tieng bang NUT TAT TIENG TRACK cua CapCut (bit 0 cua
+  track["attribute"]), giu nguyen volume tung segment, KHONG xoa.
+- Chi 1 ngon ngu duoc bat tieng, cac track ngon ngu con lai cung tat bang nut
+  tat tieng track (volume van 1.0 -> bam icon loa trong CapCut la nghe duoc).
 - Khong bao gio ghi de file goc o day: ghi ra draft_content.dubbed.json;
   apply_to_project() moi thay file goc (sau khi backup).
 """
@@ -86,12 +88,12 @@ def build_dubbed_draft(draft: dict, track_index: int, languages: list) -> dict:
         raise ProjectError("Không tìm thấy material của track gốc (cấu trúc draft lạ).")
     template_material = index[template_seg["material_id"]][1]
 
-    # 1. Mute track goc
+    # 1. Tat tieng track goc bang NUT TAT TIENG TRACK cua CapCut (giu nguyen volume
+    #    tung doan). Ban cu cua tool keo volume ve 0 -> tra lai muc cu da luu.
     for seg in orig_track["segments"]:
-        vol = float(seg.get("volume", 1.0))
-        if vol > 0:
-            seg["last_nonzero_volume"] = vol
-        seg["volume"] = 0.0
+        if float(seg.get("volume", 1.0)) == 0.0 and float(seg.get("last_nonzero_volume", 0) or 0) > 0:
+            seg["volume"] = float(seg["last_nonzero_volume"])
+    set_track_muted(orig_track, True)
 
     # 2. Them 1 track cho moi ngon ngu
     for lang in languages:
@@ -111,14 +113,13 @@ def build_dubbed_draft(draft: dict, track_index: int, languages: list) -> dict:
         new_track["is_default_name"] = False
         new_track["segments"] = []
 
-        volume = 1.0 if lang.audible else 0.0
         for target_us, source_us, dur_us in lang.placements:
             seg = copy.deepcopy(template_seg)
             seg["id"] = _new_id()
             seg["material_id"] = material["id"]
             seg["source_timerange"] = {"start": int(source_us), "duration": int(dur_us)}
             seg["target_timerange"] = {"start": int(target_us), "duration": int(dur_us)}
-            seg["volume"] = volume
+            seg["volume"] = 1.0
             seg["last_nonzero_volume"] = 1.0
             seg["speed"] = 1.0
             if "track_render_index" in seg:
@@ -126,8 +127,29 @@ def build_dubbed_draft(draft: dict, track_index: int, languages: list) -> dict:
             seg["extra_material_refs"] = _clone_refs(template_seg.get("extra_material_refs", []),
                                                      index, materials)
             new_track["segments"].append(seg)
+        # Chi 1 ngon ngu bat tieng; cac ngon ngu khac tat bang nut tat tieng track
+        set_track_muted(new_track, not lang.audible)
         d["tracks"].append(new_track)
     return d
+
+
+# Bit 0 cua track["attribute"] = nut "tat tieng" (icon loa) tren dau track trong
+# CapCut. Da doi chieu voi project that: track hien loa gach cheo co attribute=1,
+# track binh thuong attribute=0. Moi segment luu ban sao o "track_attribute".
+TRACK_MUTE_BIT = 1
+
+
+def is_track_muted(track: dict) -> bool:
+    return bool(int(track.get("attribute", 0) or 0) & TRACK_MUTE_BIT)
+
+
+def set_track_muted(track: dict, muted: bool):
+    attr = int(track.get("attribute", 0) or 0)
+    attr = attr | TRACK_MUTE_BIT if muted else attr & ~TRACK_MUTE_BIT
+    track["attribute"] = attr
+    for seg in track.get("segments", []):
+        if "track_attribute" in seg:
+            seg["track_attribute"] = attr
 
 
 def _remove_previous_dub_tracks(d: dict, orig_track: dict, names: set):
@@ -176,9 +198,12 @@ def validate_dubbed(d: dict, orig_track_id: str, languages: list):
     for lang in languages:
         if sum(1 for t in d["tracks"] if t.get("name") == lang.name) != 1:
             raise ProjectError(f"Kiểm tra thất bại: có nhiều track tên {lang.name}.")
-    for seg in orig["segments"]:
-        if seg["volume"] != 0.0:
-            raise ProjectError("Kiểm tra thất bại: track gốc chưa được tắt tiếng hết.")
+    if not is_track_muted(orig):
+        raise ProjectError("Kiểm tra thất bại: track gốc chưa được tắt tiếng.")
+    audible = [t.get("name") for t in d["tracks"]
+               if t.get("name") in {lang.name for lang in languages} and not is_track_muted(t)]
+    if len(audible) > 1:
+        raise ProjectError(f"Kiểm tra thất bại: nhiều track lồng tiếng cùng bật tiếng ({', '.join(audible)}).")
     new_tracks = d["tracks"][-len(languages):] if languages else []
     for lang, track in zip(languages, new_tracks):
         segs = sorted(track["segments"], key=lambda s: s["target_timerange"]["start"])
