@@ -480,7 +480,8 @@ class MainWindow(QMainWindow):
         if row < 0:
             return
         changed, logo = edit_logo(self, self.table.item(row, COL_NAME).text().strip(),
-                                  self.video_edit.text().strip(), self._row_logo(row), self._audio_dir())
+                                  self.video_edit.text().strip(), self._row_logo(row), self._audio_dir(),
+                                  self.project.canvas if self.project else None)
         if changed or not logo:
             self._set_logo(row, logo)
 
@@ -517,7 +518,8 @@ class MainWindow(QMainWindow):
         self._add_language(name.strip(), chosen)
 
     def _add_many_languages(self):
-        dialog = MultiLanguageDialog(self, self._audio_dir(), video_path=self.video_edit.text().strip())
+        dialog = MultiLanguageDialog(self, self._audio_dir(), video_path=self.video_edit.text().strip(),
+                                     capcut_canvas=self.project.canvas if self.project else None)
         if dialog.exec():
             entries = dialog.entries()
             for name, audio_parts, logo in entries:

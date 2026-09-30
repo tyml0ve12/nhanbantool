@@ -41,6 +41,39 @@ class LogoPlacement:
         return LogoPlacement(x=x, y=y, width=width)
 
 
+# ---- Quy doi voi thong so "Bien doi" cua CapCut (Ty le %, Vi tri X, Y) ----
+# Da doi chieu voi project that (10 logo, khung 1920x1080): draft luu clip.scale va
+# clip.transform (x, y); giao dien CapCut hien:
+#   Ty le % = scale x 100 ; X = transform.x x be ngang khung ; Y = transform.y x be cao khung
+#   (vd transform (0.891566, 0.778571) -> X 1712, Y 840 tren khung 1920x1080).
+# transform tinh theo NUA khung -> tam logo lech khoi tam khung (X/2, Y/2) diem anh, Y duong = len.
+# Ty le 100% = anh co VUA KHUNG (khop theo canh, ke ca anh nho hon khung).
+CAPCUT_CANVASES = {"1080p (1920 × 1080)": (1920, 1080), "4K (3840 × 2160)": (3840, 2160)}
+
+
+def _capcut_base(logo_w, logo_h, canvas_w, canvas_h) -> float:
+    return min(canvas_w / logo_w, canvas_h / logo_h)
+
+
+def from_capcut(scale_pct, x, y, logo_w, logo_h, canvas, remove_bg=True) -> LogoPlacement:
+    cw, ch = canvas
+    base = _capcut_base(logo_w, logo_h, cw, ch)
+    w_px, h_px = logo_w * base * scale_pct / 100, logo_h * base * scale_pct / 100
+    cx, cy = cw / 2 + x / 2, ch / 2 - y / 2
+    return LogoPlacement(x=(cx - w_px / 2) / cw, y=(cy - h_px / 2) / ch, width=w_px / cw, remove_bg=remove_bg)
+
+
+def to_capcut(p: LogoPlacement, logo_w, logo_h, canvas) -> tuple:
+    """(ty_le_%, X, Y) nhu CapCut hien thi."""
+    cw, ch = canvas
+    base = _capcut_base(logo_w, logo_h, cw, ch)
+    w_px = p.width * cw
+    h_px = w_px * logo_h / max(1, logo_w)
+    scale_pct = w_px / (logo_w * base) * 100
+    cx, cy = p.x * cw + w_px / 2, p.y * ch + h_px / 2
+    return scale_pct, (cx - cw / 2) * 2, (ch / 2 - cy) * 2
+
+
 def _to_rgba_array(img: QImage) -> np.ndarray:
     img = img.convertToFormat(QImage.Format.Format_RGBA8888)
     ptr = img.constBits()
@@ -188,10 +221,23 @@ def grab_frame(video_path: str) -> str:
 
 def overlay_geometry(placement: LogoPlacement, logo_w: int, logo_h: int, video_w: int, video_h: int) -> tuple:
     """(x, y, w, h) theo pixel tren video, so chan (yeu cau cua bo nen)."""
+    """KHONG ep logo vao trong khung: logo lan ra ngoai mep (nhu CapCut cho phep) thi
+    render se cat phan thua - giu dung vi tri da dat."""
     w = max(2, int(round(placement.width * video_w / 2)) * 2)
     h = max(2, int(round(w * logo_h / max(1, logo_w) / 2)) * 2)
     x = int(round(placement.x * video_w))
     y = int(round(placement.y * video_h))
-    x = min(max(0, x), max(0, video_w - w))
-    y = min(max(0, y), max(0, video_h - h))
     return x, y, w, h
+
+
+def visible_part(x, y, w, h, video_w, video_h):
+    """Phan logo nam trong khung: (cat_x, cat_y, cat_w, cat_h, dat_x, dat_y) - so chan.
+    None neu logo nam han ngoai khung."""
+    cx0, cy0 = max(0, -x), max(0, -y)
+    cw = min(w, video_w - x) - cx0
+    ch = min(h, video_h - y) - cy0
+    cx0, cy0 = cx0 // 2 * 2, cy0 // 2 * 2
+    cw, ch = cw // 2 * 2, ch // 2 * 2
+    if cw <= 0 or ch <= 0:
+        return None
+    return cx0, cy0, cw, ch, max(0, x), max(0, y)

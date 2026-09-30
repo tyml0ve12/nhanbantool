@@ -92,12 +92,13 @@ class MultiLanguageDialog(QDialog):
 
     COL_NAME, COL_AUDIO, COL_LOGO, COL_DEL = range(4)
 
-    def __init__(self, parent, start_dir: str, rows: int = 3, video_path: str = ""):
+    def __init__(self, parent, start_dir: str, rows: int = 3, video_path: str = "", capcut_canvas=None):
         super().__init__(parent)
         self.setWindowTitle("Thêm nhiều ngôn ngữ")
         self.resize(900, 420)
         self.start_dir = start_dir
         self.video_path = video_path
+        self.capcut_canvas = capcut_canvas
         self._parts = {}   # id(combo) -> [phan]
         self._logos = {}
 
@@ -199,7 +200,7 @@ class MultiLanguageDialog(QDialog):
         # import trong ham: logo_dialog cung import tu module nay
         from ui.logo_dialog import edit_logo, logo_label
         changed, logo = edit_logo(self, combo.currentText().strip() or "ngôn ngữ", self.video_path,
-                                  self._logos.get(id(combo)), self.start_dir)
+                                  self._logos.get(id(combo)), self.start_dir, self.capcut_canvas)
         if changed or not logo:
             self._logos[id(combo)] = logo
             button.setText(logo_label(logo).replace("＋ Thêm logo", "＋ Logo…"))

@@ -38,6 +38,7 @@ class ProjectInfo:
     audio_tracks: list = field(default_factory=list)
     video_path_in_draft: str = ""
     video_path_found: str = ""         # video tim thay that tren may (co the rong)
+    canvas: tuple = (1920, 1080)       # khung hinh cua project CapCut (de quy doi vi tri logo)
 
     @property
     def main_track(self):
@@ -123,6 +124,8 @@ def load_project(path: str) -> ProjectInfo:
         audio_tracks=audio_tracks,
         video_path_in_draft=video_path,
         video_path_found=_guess_video(project_root, video_path),
+        canvas=(int((d.get("canvas_config") or {}).get("width") or 1920),
+                int((d.get("canvas_config") or {}).get("height") or 1080)),
     )
 
 

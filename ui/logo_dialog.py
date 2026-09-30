@@ -6,9 +6,10 @@ from PySide6.QtCore import Qt, QRectF, QPointF, Signal
 from PySide6.QtGui import QPainter, QPixmap, QColor, QPen, QImage
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QSlider, QPushButton, QCheckBox, QWidget, QMessageBox,
+    QDoubleSpinBox, QComboBox,
 )
 
-from core.logo import LogoPlacement, load_logo, grab_frame
+from core.logo import LogoPlacement, load_logo, grab_frame, CAPCUT_CANVASES, from_capcut, to_capcut
 from ui.language_dialog import pick_logo
 
 HANDLE = 10          # vung bat goc de keo doi kich thuoc (px man hinh)
@@ -68,7 +69,9 @@ class LogoCanvas(QWidget):
         if self.logo.isNull():
             return
         r = self.logo_rect()
+        painter.setClipRect(f)          # logo lan ra ngoai mep -> chi hien phan trong khung (nhu video that)
         painter.drawImage(r, self.logo)
+        painter.setClipping(False)
         painter.setPen(QPen(QColor("white"), 1.5, Qt.PenStyle.DashLine))
         painter.drawRect(r)
         painter.setPen(Qt.PenStyle.NoPen)
@@ -138,7 +141,8 @@ class LogoCanvas(QWidget):
 class LogoDialog(QDialog):
     """Tra ve (qua .result_logo) dict {"path", "placement"} hoac None neu bo logo."""
 
-    def __init__(self, parent, language: str, video_path: str, logo: dict = None, start_dir: str = ""):
+    def __init__(self, parent, language: str, video_path: str, logo: dict = None, start_dir: str = "",
+                 capcut_canvas: tuple = None):
         super().__init__(parent)
         self.setWindowTitle(f"Logo kênh — {language}")
         self.start_dir = start_dir
@@ -161,6 +165,44 @@ class LogoDialog(QDialog):
         self.size_label = QLabel()
         self.size_label.setMinimumWidth(110)
         row.addWidget(self.size_label)
+        v.addLayout(row)
+
+        # Thong so giong bang "Bien doi" cua CapCut - go so tu CapCut de dat dung vi tri
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Theo CapCut:"))
+        row.addWidget(QLabel("Tỷ lệ"))
+        self.cc_scale = QDoubleSpinBox()
+        self.cc_scale.setRange(1, 400)
+        self.cc_scale.setDecimals(0)
+        self.cc_scale.setSuffix(" %")
+        row.addWidget(self.cc_scale)
+        row.addWidget(QLabel("X"))
+        self.cc_x = QDoubleSpinBox()
+        self.cc_x.setRange(-8000, 8000)
+        self.cc_x.setDecimals(0)
+        row.addWidget(self.cc_x)
+        row.addWidget(QLabel("Y"))
+        self.cc_y = QDoubleSpinBox()
+        self.cc_y.setRange(-8000, 8000)
+        self.cc_y.setDecimals(0)
+        row.addWidget(self.cc_y)
+        row.addWidget(QLabel("Khung CapCut"))
+        self.cc_canvas = QComboBox()
+        for label, size in CAPCUT_CANVASES.items():
+            self.cc_canvas.addItem(label, size)
+        if capcut_canvas:
+            # Mac dinh = khung cua project CapCut dang mo (doc tu draft)
+            idx = self.cc_canvas.findData(tuple(capcut_canvas))
+            if idx < 0:
+                self.cc_canvas.addItem(f"{capcut_canvas[0]} × {capcut_canvas[1]} (project)", tuple(capcut_canvas))
+                idx = self.cc_canvas.count() - 1
+            self.cc_canvas.setCurrentIndex(idx)
+        row.addWidget(self.cc_canvas)
+        row.addStretch(1)
+        for w in (self.cc_scale, self.cc_x, self.cc_y):
+            w.setKeyboardTracking(False)          # cap nhat khi go xong / bam mui ten
+            w.valueChanged.connect(self._from_capcut_fields)
+        self.cc_canvas.currentIndexChanged.connect(self._sync_capcut_fields)
         v.addLayout(row)
 
         row = QHBoxLayout()
@@ -230,12 +272,46 @@ class LogoDialog(QDialog):
         c._clamp()
         c.update()
         self.size_label.setText(f"{value}% bề ngang")
+        self._sync_capcut_fields()
 
     def _sync_slider(self):
         self.slider.blockSignals(True)
         self.slider.setValue(round(self.canvas.placement.width * 100))
         self.slider.blockSignals(False)
         self.size_label.setText(f"{round(self.canvas.placement.width * 100)}% bề ngang")
+        self._sync_capcut_fields()
+
+    def _logo_size(self):
+        img = self.canvas.logo
+        return (img.width(), img.height()) if not img.isNull() else (0, 0)
+
+    def _sync_capcut_fields(self):
+        """Vi tri tren khung xem truoc -> so Ty le / X / Y theo CapCut."""
+        if not hasattr(self, "cc_scale"):
+            return
+        lw, lh = self._logo_size()
+        if not lw:
+            return
+        scale, x, y = to_capcut(self.canvas.placement, lw, lh, self.cc_canvas.currentData())
+        for w, val in ((self.cc_scale, scale), (self.cc_x, x), (self.cc_y, y)):
+            w.blockSignals(True)
+            w.setValue(round(val))
+            w.blockSignals(False)
+
+    def _from_capcut_fields(self):
+        """Go so Ty le / X / Y (tu CapCut) -> dat logo dung vi tri do."""
+        lw, lh = self._logo_size()
+        if not lw:
+            return
+        p = from_capcut(self.cc_scale.value(), self.cc_x.value(), self.cc_y.value(), lw, lh,
+                        self.cc_canvas.currentData(), self.remove_bg.isChecked())
+        p.width = min(MAX_W, max(MIN_W, p.width))
+        self.canvas.placement = p          # khong ep vao trong khung - giu dung so CapCut
+        self.canvas.update()
+        self.slider.blockSignals(True)
+        self.slider.setValue(round(p.width * 100))
+        self.slider.blockSignals(False)
+        self.size_label.setText(f"{round(p.width * 100)}% bề ngang")
 
     def _change_image(self):
         path = pick_logo(self, os.path.dirname(self.path) if self.path else self.start_dir)
@@ -255,14 +331,14 @@ class LogoDialog(QDialog):
         self.accept()
 
 
-def edit_logo(parent, language: str, video_path: str, logo: dict, start_dir: str):
+def edit_logo(parent, language: str, video_path: str, logo: dict, start_dir: str, capcut_canvas=None):
     """Mo luong them/sua logo. Chua co logo -> chon anh truoc. Tra ve (thay_doi?, logo_moi)."""
     if not logo or not logo.get("path"):
         path = pick_logo(parent, start_dir)
         if not path:
             return False, logo
         logo = {"path": path, "placement": None}
-    dlg = LogoDialog(parent, language, video_path, logo, start_dir)
+    dlg = LogoDialog(parent, language, video_path, logo, start_dir, capcut_canvas)
     if dlg.exec():
         return True, dlg.result_logo
     return False, (logo if logo.get("placement") else None)

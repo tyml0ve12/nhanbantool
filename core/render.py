@@ -152,22 +152,32 @@ def _video_plan(settings, info, encoder, logo_png, logo_geo, gpu):
     w, h = target_size(settings, info)
     fps_args = ["-r", f"{settings.fps:g}"] if settings.fps and abs(settings.fps - info.fps) > 0.5 else []
     scale = (w, h) != (info.width, info.height)
+    logo_chain = None
+    if logo_png and logo_geo:
+        from core.logo import visible_part
+        x, y, lw, lh = logo_geo
+        vis = visible_part(x, y, lw, lh, w, h)
+        if vis:
+            # Logo lan ra ngoai mep (CapCut cho phep): cat phan thua, giu dung vi tri
+            cx0, cy0, cw, ch, px, py = vis
+            crop = f",crop={cw}:{ch}:{cx0}:{cy0}" if (cw, ch) != (lw, lh) else ""
+            logo_chain = (f"scale={lw}:{lh}{crop}", px, py)
     if gpu:
         pre = ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
         chain = f"scale_cuda={w}:{h}:format=yuv420p" if scale else "scale_cuda=format=yuv420p"
-        if logo_png:
-            x, y, lw, lh = logo_geo
-            graph = (f"[0:v]{chain}[m];[2:v]scale={lw}:{lh},format=yuva420p,hwupload_cuda[l];"
-                     f"[m][l]overlay_cuda={x}:{y}[v]")
+        if logo_chain:
+            f, px, py = logo_chain
+            graph = (f"[0:v]{chain}[m];[2:v]{f},format=yuva420p,hwupload_cuda[l];"
+                     f"[m][l]overlay_cuda={px}:{py}[v]")
         else:
             graph = f"[0:v]{chain}[v]"
     else:
         pre = []
         parts = [f"scale={w}:{h}:flags=lanczos"] if scale else []
-        if logo_png:
-            x, y, lw, lh = logo_geo
+        if logo_chain:
+            f, px, py = logo_chain
             base = ",".join(parts) or "null"
-            graph = f"[0:v]{base}[m];[2:v]scale={lw}:{lh}[l];[m][l]overlay={x}:{y},format=yuv420p[v]"
+            graph = f"[0:v]{base}[m];[2:v]{f}[l];[m][l]overlay={px}:{py},format=yuv420p[v]"
         else:
             graph = f"[0:v]{','.join(parts + ['format=yuv420p'])}[v]"
     venc = _encoder_args(encoder, settings) + fps_args
