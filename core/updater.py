@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import urllib.error
 import urllib.request
 import zipfile
 from dataclasses import dataclass
@@ -62,8 +63,16 @@ def check_for_update(timeout: float = 10) -> Optional[UpdateInfo]:
     """Tra ve UpdateInfo neu tren GitHub co ban moi hon ban dang chay, nguoc lai None.
     Loi mang se nem exception - noi goi tu quyet dinh bo qua hay bao loi."""
     manifest_url = f"https://github.com/{GITHUB_REPO}/releases/latest/download/latest.json"
-    with _open_url(manifest_url, timeout) as resp:
-        data = json.loads(resp.read().decode("utf-8-sig"))
+    try:
+        with _open_url(manifest_url, timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8-sig"))
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            # Repo chua co ban phat hanh nao (hoac ban moi nhat thieu latest.json) -> coi nhu
+            # dang dung ban moi nhat, KHONG bao loi mang (mang van binh thuong).
+            log.info("Chua co ban phat hanh tren GitHub (404) - bo qua")
+            return None
+        raise
     info = UpdateInfo(
         version=str(data["version"]),
         notes=str(data.get("notes", "")),
