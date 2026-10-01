@@ -41,4 +41,45 @@ def setup_logging() -> str:
         pass
 
     logging.info("=== Nhan Ban Long Tieng khoi dong - log tai: %s ===", log_path)
+    _log_environment()
     return log_path
+
+
+# Thu vien hay gay loi khi lech phien ban giua cac may (vd av 19 bo metadata_errors)
+_PACKAGES = ("faster-whisper", "av", "ctranslate2", "onnxruntime", "tokenizers", "numpy", "PySide6")
+
+
+def _log_environment():
+    """Ghi phien ban app / Python / Windows / thu vien -> doc log la biet may khach khac gi."""
+    import platform
+    import sys
+    from importlib import metadata
+    from core.version import APP_VERSION
+
+    versions = []
+    for name in _PACKAGES:
+        try:
+            versions.append(f"{name}={metadata.version(name)}")
+        except metadata.PackageNotFoundError:
+            versions.append(f"{name}=(chua cai)")
+    logging.info("App v%s | Python %s (%s) | %s", APP_VERSION, platform.python_version(),
+                 sys.executable, platform.platform())
+    logging.info("Thu vien: %s", ", ".join(versions))
+
+
+def make_support_zip(max_files: int = 5) -> str:
+    """Nen cac file log moi nhat thanh 1 file zip de nguoi dung gui ve. Tra ve duong dan zip."""
+    import zipfile
+
+    log_dir = get_log_dir()
+    files = sorted(
+        (f for f in os.listdir(log_dir) if f.startswith(LOG_PREFIX) and f.endswith(".log")),
+        reverse=True,
+    )[:max_files]
+    zip_path = os.path.join(log_dir, f"log_gui_ho_tro_{datetime.now():%Y%m%d_%H%M%S}.zip")
+    for handler in logging.getLogger().handlers:
+        handler.flush()
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for f in files:
+            zf.write(os.path.join(log_dir, f), f)
+    return zip_path

@@ -1,6 +1,7 @@
 """Cua so chinh: Project goc -> Danh sach ngon ngu -> Chay -> Log."""
 import logging
 import os
+import subprocess
 from datetime import datetime
 
 from PySide6.QtCore import Qt, QSettings, QTimer, QThread, Signal, QUrl
@@ -13,6 +14,7 @@ from PySide6.QtWidgets import (
 )
 
 from core import draft_patch
+from core.applog import make_support_zip
 from core.capcut_project import (
     ProjectError, load_project, scan_audio_folder, language_name_from_file,
     list_capcut_projects, is_registered_in_capcut,
@@ -339,6 +341,10 @@ class MainWindow(QMainWindow):
         v.addWidget(self.log_view)
 
         row = QHBoxLayout()
+        log_btn = QPushButton("Xuất log gửi hỗ trợ")
+        log_btn.setToolTip("Gói nhật ký hoạt động thành 1 file zip để gửi cho người hỗ trợ khi gặp lỗi")
+        log_btn.clicked.connect(self._export_support_log)
+        row.addWidget(log_btn)
         row.addStretch(1)
         self.apply_btn = QPushButton("Áp dụng vào project")
         self.apply_btn.setToolTip("Dùng khi lúc chạy CapCut đang mở nên chưa áp dụng được")
@@ -785,6 +791,17 @@ class MainWindow(QMainWindow):
             os.startfile(path)
         else:
             QMessageBox.information(self, "Mở thư mục xuất", "Thư mục xuất chưa tồn tại (sẽ được tạo khi xuất mp4).")
+
+    def _export_support_log(self):
+        try:
+            zip_path = make_support_zip()
+        except OSError as e:
+            log.exception("Khong tao duoc file log gui ho tro")
+            QMessageBox.warning(self, "Xuất log", f"Không tạo được file log: {e}")
+            return
+        subprocess.Popen(["explorer", "/select,", zip_path])
+        QMessageBox.information(self, "Xuất log",
+                                f"Đã tạo file log:\n{zip_path}\n\nGửi file này cho người hỗ trợ để kiểm tra lỗi.")
 
     def _refresh_capcut_state(self):
         if is_capcut_running():

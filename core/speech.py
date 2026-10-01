@@ -87,6 +87,7 @@ def is_model_downloaded(model: str) -> bool:
 def load_model(model: str, device: str, on_log: Callable[[str], None]):
     """Tra ve (WhisperModel, device_thuc_te)."""
     add_nvidia_dll_dirs()
+    _patch_av_metadata_errors()
     from faster_whisper import WhisperModel
 
     # Model da co tren may -> khong ket noi HuggingFace (nhanh hon, chay duoc khi mat mang)
@@ -104,6 +105,24 @@ def load_model(model: str, device: str, on_log: Callable[[str], None]):
             on_log(f"Không chạy được trên GPU ({_short(e)}) → chuyển sang CPU.")
     m = WhisperModel(model, device="cpu", compute_type="int8", **common)
     return m, "cpu"
+
+
+def _patch_av_metadata_errors():
+    """faster-whisper <= 1.2.1 goi av.open(..., metadata_errors="ignore") nhung PyAV 19
+    da bo tham so nay -> loi "unexpected keyword argument 'metadata_errors'" tren may
+    cai thu vien moi. Bo tham so do khi av >= 19 (giong cach faster-whisper master sua)."""
+    import av
+    if int(av.__version__.split(".")[0]) < 19 or getattr(av.open, "_nhanban_patched", False):
+        return
+    original_open = av.open
+
+    def open_without_metadata_errors(*args, **kwargs):
+        kwargs.pop("metadata_errors", None)
+        return original_open(*args, **kwargs)
+
+    open_without_metadata_errors._nhanban_patched = True
+    av.open = open_without_metadata_errors
+    log.info("PyAV %s: bo tham so metadata_errors khi faster-whisper goi av.open", av.__version__)
 
 
 def _warm_up(model):
