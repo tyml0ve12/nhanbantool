@@ -49,8 +49,11 @@ function Test-PythonRuns($pythonExe, $code) {
     }
 }
 
+# faster-whisper < 1.1.1 goi av.open(metadata_errors=...) - PyAV 14+ da bo tham so nay
+# -> loi "unexpected keyword argument 'metadata_errors'". Ban cu coi nhu thieu thu vien
+# de buoc 1b pip install -r requirements.txt nang cap len.
 function Test-LibsWork($pythonExe) {
-    return Test-PythonRuns $pythonExe "import PySide6.QtWidgets, faster_whisper, onnxruntime, tokenizers"
+    return Test-PythonRuns $pythonExe "import re, PySide6.QtWidgets, faster_whisper, onnxruntime, tokenizers; assert tuple(int(x) for x in re.findall(r'\d+', faster_whisper.__version__)[:3]) >= (1, 1, 1)"
 }
 
 # PySide6 / ctranslate2 chi co ban cai san cho Python 64-bit, 3.10 tro len.
