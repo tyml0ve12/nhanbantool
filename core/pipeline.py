@@ -98,6 +98,20 @@ def _text_of(material: dict) -> str:
     return str(content or material.get("recognize_text", ""))
 
 
+def _visible_text(material: dict, duration_us: int) -> str:
+    """Chu THUC SU hien trong doan phu de. CapCut cat doi 1 dong phu de thi ca 2
+    nua van giu nguyen ca cau trong "text", chi danh dau bang moc tung chu (words):
+    chu co thoi luong 0 hoac bat dau sau khi doan ket thuc la chu bi an.
+    Vd "o Sahara cuoc song khong duoc cho di" cat doi -> "o Sahara cuoc song" | "song khong duoc cho di"."""
+    words = material.get("words") or {}
+    texts, starts, ends = words.get("text") or [], words.get("start_time") or [], words.get("end_time") or []
+    if not texts or not (len(texts) == len(starts) == len(ends)):
+        return _text_of(material)
+    limit_ms = duration_us / 1000
+    shown = [t for t, a, b in zip(texts, starts, ends) if b > a and a < limit_ms]
+    return " ".join(shown) if shown else _text_of(material)
+
+
 def subtitle_texts(draft: dict, clips: list) -> tuple:
     """Noi dung tung cau goc lay tu track phu de (thuong la phu de tieng Viet
     do CapCut tao, dat khop thoi gian voi giong goc). Moi doan phu de gan vao
@@ -114,7 +128,7 @@ def subtitle_texts(draft: dict, clips: list) -> tuple:
             mid = int(tr.get("start", 0)) + int(tr.get("duration", 0)) // 2
             i = _clip_at(clips, mid)
             if i is not None:
-                text = _text_of(texts_by_id.get(seg.get("material_id"), {})).strip()
+                text = _visible_text(texts_by_id.get(seg.get("material_id"), {}), int(tr.get("duration", 0))).strip()
                 if text:
                     buckets[i].append((int(tr.get("start", 0)), text))
         cover = sum(1 for b in buckets if b) / len(clips) if clips else 0.0

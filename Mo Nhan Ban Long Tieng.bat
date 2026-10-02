@@ -13,6 +13,14 @@ for %%P in ("C:\Python314\pythonw.exe" "%LocalAppData%\Python\bin\pythonw.exe") 
     )
 )
 
+rem Python cai tu python.org (mac dinh khong tick "Add to PATH") va Python install
+rem manager (pythoncore-3.x-64) -> khong co trong PATH, do thang thu muc cai.
+for /d %%D in ("%LocalAppData%\Programs\Python\Python3*" "%LocalAppData%\Python\pythoncore-3*") do (
+    if not defined PYW if exist "%%~D\pythonw.exe" (
+        "%%~D\python.exe" -c "import PySide6, faster_whisper" >nul 2>&1 && set "PYW=%%~D\pythonw.exe"
+    )
+)
+
 if not defined PYW (
     for /f "delims=" %%P in ('where pythonw 2^>nul ^| findstr /v /i "WindowsApps"') do (
         if not defined PYW (
