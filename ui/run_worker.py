@@ -184,13 +184,26 @@ class RunWorker(QThread):
 
     # ------------------------------------------------------------------
     def _original_texts(self, draft, clips):
-        """Noi dung cau goc de so nghia: uu tien phu de, roi toi nhan dang giong goc."""
+        """Noi dung cau goc de so nghia: UU TIEN nhan dang giong goc (cat dung theo tung
+        clip), phu de chi de bu cau trong / khi khong tim thay file giong goc.
+        Phu de CapCut la ban DICH cua giong goc (them sai so dich), hay vat qua 2 clip,
+        bi cat doi, hoac lay nham track (vd track phu de tao tu giong nhan ban). Do tren
+        project 232 + 107 (12 ban long tieng): giong goc dung 97.5% cau so voi 94.6%."""
+        voice = self._original_voice_texts(clips)
+        if voice and sum(1 for t in voice if t) >= 0.8 * len(clips):
+            subs, _ = pipeline.subtitle_texts(draft, clips)
+            filled = [i + 1 for i, (v, s) in enumerate(zip(voice, subs)) if not v and s]
+            texts = [v or s for v, s in zip(voice, subs)]
+            empty = sum(1 for t in texts if not t)
+            self.log.emit("Nội dung câu gốc: nhận dạng từ giọng gốc"
+                          + (f", {len(filled)} câu không nghe được lấy từ phụ đề" if filled else "")
+                          + (f", {empty} câu không có nội dung" if empty else "") + ".")
+            return texts
         texts, cover = pipeline.subtitle_texts(draft, clips)
         if cover >= 1.0:
             self.log.emit("Nội dung câu gốc: lấy từ track phụ đề (100% câu có phụ đề).")
             return texts
         missing = [i + 1 for i, t in enumerate(texts) if not t]
-        voice = self._original_voice_texts(clips)
         if cover >= MIN_SUBTITLE_COVER:
             if voice:
                 # Doan khong co phu de (vd cau tieu de nam o track chu khac) -> lay tu giong goc
@@ -269,10 +282,18 @@ class RunWorker(QThread):
         self.language_status.emit(job.row, "Đang tách câu…", "run")
         silences = audio.detect_silences(job.audio_path)
         texts_in_order = [source_texts[i] for i in self._order] if source_texts else None
-        result = segmenter.split_sentences(words, durations, silences, dur, texts_in_order,
-                                           self._embed() if source_texts else None,
-                                           labels=[i + 1 for i in self._order],
-                                           pair_gaps=self._pair_gaps(clips))
+        split_args = dict(labels=[i + 1 for i in self._order], pair_gaps=self._pair_gaps(clips))
+        embedder = self._embed() if source_texts else None
+        try:
+            result = segmenter.split_sentences(words, durations, silences, dur, texts_in_order, embedder, **split_args)
+        except segmenter.TooFewPausesError as e:
+            # Doc qua lien mach (vd tieng A Rap) -> do lai khoang lang nhay hon roi thu lai
+            log.info("%s: %s -> do lai khoang lang nhay hon", job.name, e)
+            self.log.emit(f"[{job.name}] Audio đọc liền mạch, ít chỗ ngắt → đo lại khoảng lặng nhạy hơn…")
+            silences = audio.detect_silences(job.audio_path, noise_db=segmenter.LOOSE_NOISE_DB,
+                                             min_len=segmenter.LOOSE_MIN_PAUSE)
+            result = segmenter.split_sentences(words, durations, silences, dur, texts_in_order, embedder,
+                                               min_pause=segmenter.LOOSE_MIN_PAUSE, **split_args)
         self._set_progress(job, share)
         # Cau thu k (thu tu doc) thuoc ve clip self._order[k] -> xep lai theo timeline
         by_clip = [None] * len(clips)

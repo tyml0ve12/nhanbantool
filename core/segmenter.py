@@ -23,6 +23,11 @@ SENTENCE_END_RE = re.compile(r"[.!?。！？…]+[\"'”’»)\]]*$")
 PHRASE_END_RE = re.compile(r"[.,;:!?…。！？、，»”’\"')\]-]+$")   # tu co dau cau bat ky o cuoi
 
 MIN_PAUSE = 0.12          # cho ngat ngan hon muc nay khong lam ranh gioi (giay)
+# Audio doc qua lien mach (vd tieng A Rap: 128 khoang lang cho 131 cau) -> do lai khoang
+# lang nhay hon: nguong am to hon (-30 dB thay -35) va ngung ngan hon. Do tren bai 107
+# tieng A Rap: tu LOI -> tach du 131 cau, do khop 0.918.
+LOOSE_NOISE_DB = -30
+LOOSE_MIN_PAUSE = 0.06
 MAX_UNITS = 16            # 1 cau toi da trai qua bao nhieu doan giua 2 cho ngat
 REFINE_RADIUS = 1         # buoc so nghia chinh xac: xe dich moi ranh gioi +-1 cho ngat
 MERGE_PENALTY = 2.0       # phat khi gop 2 cau goc vao 1 doan (chi gop khi ro rang tot hon)
@@ -55,6 +60,11 @@ class SegmentError(Exception):
     pass
 
 
+class TooFewPausesError(SegmentError):
+    """Audio doc qua lien mach (vd tieng A Rap), khong du khoang lang de tach du cau.
+    Nguoi goi thu lai voi khoang lang do nhay hon (audio.detect_silences loose)."""
+
+
 @dataclass
 class Sentence:
     start: float        # vi tri cat trong file audio (giay)
@@ -83,7 +93,7 @@ def _speech_bounds(words, silences, duration):
     return first, last
 
 
-def _candidates(words, silences, t0, t1):
+def _candidates(words, silences, t0, t1, min_pause=MIN_PAUSE):
     """Cac cho ngat trong audio: (het tieng, bat dau tieng lai, diem thuong).
     Nguon 1: khoang lang do duoc (ffmpeg). Nguon 2: DAU CHAM CAU whisper nhan ra
     ma khoang ngat qua ngan de do duoc (vd "…em silêncio total. Elas caçam…") -
@@ -91,7 +101,7 @@ def _candidates(words, silences, t0, t1):
     cands = []
     wi = 0
     for s, e in silences:
-        if e - s < MIN_PAUSE or s <= t0 or e >= t1:
+        if e - s < min_pause or s <= t0 or e >= t1:
             continue
         while wi + 1 < len(words) and words[wi + 1].end <= s + 0.35:
             wi += 1
@@ -118,7 +128,7 @@ def _candidates(words, silences, t0, t1):
 
 def split_sentences(words, original_durations, silences, audio_duration,
                     original_texts=None, embedder=None, on_log=None, labels=None,
-                    pair_gaps=None) -> SegmentResult:
+                    pair_gaps=None, min_pause=MIN_PAUSE) -> SegmentResult:
     """labels: so thu tu hien thi cua tung cau trong canh bao (vd so thu tu tren
     timeline khi cau duoc can theo thu tu doc). Mac dinh 1..N.
     pair_gaps[k]: khoang cach tren timeline (giay) giua cau goc k va k+1 (thu tu doc)
@@ -134,9 +144,9 @@ def split_sentences(words, original_durations, silences, audio_duration,
         raise SegmentError("Không nhận dạng được giọng nói nào trong file audio.")
 
     t0, t1 = _speech_bounds(words, silences, audio_duration)
-    cands = _candidates(words, silences, t0, t1)
+    cands = _candidates(words, silences, t0, t1, min_pause)
     if len(cands) < n - 1:
-        raise SegmentError(f"Chỉ tìm được {len(cands)} chỗ ngắt nghỉ, cần ít nhất {n - 1} để tách {n} câu. "
+        raise TooFewPausesError(f"Chỉ tìm được {len(cands)} chỗ ngắt nghỉ, cần ít nhất {n - 1} để tách {n} câu. "
                            "Audio này có thể thiếu câu hoặc đọc quá liền mạch.")
 
     node_start = [t0] + [c[1] for c in cands] + [t1]     # tieng bat dau sau node
