@@ -16,3 +16,7 @@ requement-nhan-ban.md
 HUONG_DAN_BUILD_VA_UPDATE.md
 *.dubbed*.json
 draft_content.backup_*.json
+
+# File thu nghiem (chi giu tren may)
+KET_QUA_THU_NGHIEM.md
+thu_nghiem_*/
