@@ -41,6 +41,26 @@ def detect_silences(path: str, noise_db: int = -35, min_len: float = 0.12) -> li
     return [(max(0.0, s), e) for s, e in zip(starts, ends)]
 
 
+LEVEL_FRAME_SEC = 0.01
+
+
+def levels_db(path: str):
+    """Muc am luong (dB, RMS) tung khung 10ms cua ca file - de tim cho LANG NHAT giua 2 cau.
+    Tra ve numpy array (khung i = giay i * 0.01)."""
+    import numpy as np
+    rate = 16000
+    result = subprocess.run([find_ffmpeg(), "-hide_banner", "-v", "error", "-i", path, "-vn",
+                             "-ac", "1", "-ar", str(rate), "-f", "s16le", "-"],
+                            capture_output=True, creationflags=NO_WINDOW)
+    if result.returncode != 0 or not result.stdout:
+        raise AudioError(f"Không giải mã được audio {os.path.basename(path)}:\n"
+                         f"{result.stderr.decode('utf-8', 'replace')[-400:]}")
+    x = np.frombuffer(result.stdout, dtype=np.int16).astype(np.float32) / 32768.0
+    hop = int(rate * LEVEL_FRAME_SEC)
+    n = len(x) // hop
+    return 20 * np.log10(np.sqrt((x[:n * hop].reshape(n, hop) ** 2).mean(1) + 1e-12))
+
+
 def decode_to_pcm(path: str, out_path: str):
     result = _run([find_ffmpeg(), "-hide_banner", "-y", "-i", path, "-vn",
                    "-ac", str(CHANNELS), "-ar", str(SAMPLE_RATE), "-f", "s16le", out_path])
@@ -49,9 +69,9 @@ def decode_to_pcm(path: str, out_path: str):
 
 
 def build_dub_wav(source_audio: str, placements: list, total_duration: float, out_wav: str):
-    """placements: [(vi_tri_tren_timeline, cat_tu, thoi_luong)] (giay), da sap
-    xep, khong chong nhau. Ghi ra file WAV dai dung total_duration: cho nao co
-    cau thi co tieng, con lai im lang."""
+    """placements: [(vi_tri_tren_timeline, cat_tu, thoi_luong[, tat_dau, tat_cuoi])] (giay), da sap
+    xep, khong chong nhau. tat_dau/tat_cuoi: phan keo dai o 2 dau doan -> am luong 0 (giong keyframe
+    trong draft). Ghi ra file WAV dai dung total_duration: cho nao co cau thi co tieng, con lai im lang."""
     import wave
 
     fd, pcm_path = tempfile.mkstemp(suffix=".pcm")
@@ -65,23 +85,28 @@ def build_dub_wav(source_audio: str, placements: list, total_duration: float, ou
             out.setsampwidth(2)
             out.setframerate(SAMPLE_RATE)
             written = 0
-            for target, cut_from, length in placements:
+            for placement in placements:
+                target, cut_from, length = placement[:3]
+                mute_head, mute_tail = (placement[3], placement[4]) if len(placement) >= 5 else (0.0, 0.0)
                 t0 = int(round(target * SAMPLE_RATE))
                 s0 = int(round(cut_from * SAMPLE_RATE))
                 want = int(round(length * SAMPLE_RATE))
+                head = int(round(mute_head * SAMPLE_RATE))
+                tail = int(round(mute_tail * SAMPLE_RATE))
                 if t0 < written:
                     # 2 cau NOI SAT nhau: lam tron micro-giay -> mau co the lech 1-2 mau.
                     # Lech nho (<10ms) thi bo phan du o dau cau sau; lech lon moi la loi that.
                     overlap = written - t0
                     if overlap > SAMPLE_RATE // 100:
                         raise AudioError("Các câu bị chồng lên nhau khi dựng audio (lỗi nội bộ).")
-                    t0, s0, want = written, s0 + overlap, want - overlap
+                    t0, s0, want, head = written, s0 + overlap, want - overlap, max(0, head - overlap)
                 if t0 >= total_frames:
                     break
                 _write_silence(out, t0 - written)
                 n = min(want, total_frames - t0, max(0, src_frames - s0))
                 src.seek(s0 * BYTES_PER_FRAME)
                 data = src.read(n * BYTES_PER_FRAME)
+                data = _mute_edges(data, head, max(0, tail - (want - n)))
                 out.writeframes(_fade(data))
                 written = t0 + len(data) // BYTES_PER_FRAME
             _write_silence(out, total_frames - written)
@@ -98,6 +123,29 @@ def _write_silence(out, frames):
         n = min(frames, SAMPLE_RATE)
         out.writeframes(chunk[:n * BYTES_PER_FRAME])
         frames -= n
+
+
+def _mute_edges(data: bytes, head_frames: int, tail_frames: int, ramp_ms: int = 10) -> bytes:
+    """Tat tieng (0) phan keo dai dau/cuoi doan - giong keyframe am luong ghi vao draft CapCut
+    (0 -> vuot 10ms -> 100% ... 100% -> vuot 10ms -> 0)."""
+    if head_frames <= 0 and tail_frames <= 0:
+        return data
+    import numpy as np
+    x = np.frombuffer(data, dtype=np.int16).reshape(-1, CHANNELS).astype(np.float32)
+    n = len(x)
+    env = np.ones(n, dtype=np.float32)
+    ramp = int(SAMPLE_RATE * ramp_ms / 1000)
+    if head_frames > 0:
+        h = min(n, head_frames)
+        env[:h] = 0
+        r = env[h:h + ramp]
+        env[h:h + ramp] = np.linspace(0, 1, len(r), endpoint=False)
+    if tail_frames > 0:
+        t = max(0, n - tail_frames)
+        env[t:] = 0
+        lo = max(0, t - ramp)
+        env[lo:t] = np.minimum(env[lo:t], np.linspace(1, 0, t - lo, endpoint=False))
+    return (x * env[:, None]).round().astype(np.int16).tobytes()
 
 
 def _fade(data: bytes, ms: int = 8) -> bytes:

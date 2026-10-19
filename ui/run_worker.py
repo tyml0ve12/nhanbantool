@@ -222,7 +222,9 @@ class RunWorker(QThread):
         return None
 
     def _original_voice_texts(self, clips):
-        """Noi dung tung cau goc nhan dang tu file giong goc (theo source_timerange). None neu khong co file."""
+        """Noi dung tung cau goc nhan dang tu file giong goc (theo source_timerange). None neu khong co file.
+        Dong thoi ghi self._onsets: luc giong goc bat dau noi trong tung clip (de can cau moi)."""
+        self._onsets = None
         # Tim trong project truoc; thu muc cha (vd CapCut Drafts chua ca tram project) sau cung
         search_roots = [self.config.project_dir, os.path.dirname(self.config.project_dir)]
         sources = pipeline.resolve_original_sources(clips, search_roots)
@@ -234,6 +236,7 @@ class RunWorker(QThread):
             self.log.emit(f"Đã nhận dạng giọng gốc {os.path.basename(path)} ({lang}).")
         if not words_by_file:
             return None
+        self._onsets = pipeline.original_onsets(clips, sources, words_by_file)
         return pipeline.original_texts(clips, sources, words_by_file)
 
     def _embed(self):
@@ -299,7 +302,13 @@ class RunWorker(QThread):
         by_clip = [None] * len(clips)
         for k, i in enumerate(self._order):
             by_clip[i] = result.sentences[k]
-        placements, report = pipeline.compute_placements(by_clip, clips, timeline_end)
+        # Cat o cho lang nhat giua 2 cau (giu tron chu dau/cuoi), keo dai 0.5s moi dau (phan lan sang
+        # cau ben canh tat tieng), luc bat dau noi = luc giong goc bat dau noi.
+        spans = pipeline.voice_spans(result.sentences, audio.levels_db(job.audio_path), audio.LEVEL_FRAME_SEC, dur)
+        onsets = getattr(self, "_onsets", None)
+        placements, report = pipeline.compute_placements(by_clip, clips, timeline_end, spans, onsets)
+        self.log.emit(f"[{job.name}] Mỗi câu kéo dài {pipeline.EXTEND_SEC:g}s hai đầu (phần lấn câu bên cạnh tắt tiếng); "
+                      "lúc bắt đầu nói căn theo " + ("giọng gốc." if onsets else "mép câu gốc (không có file giọng gốc)."))
         for first, second in result.merged:
             self.log.emit(f"[{job.name}] Câu {first} + {second} được đọc liền thành 1 câu → đặt ở vị trí câu "
                           f"{first}, câu {second} không có tiếng riêng.")
@@ -333,7 +342,7 @@ class RunWorker(QThread):
         fd, wav = tempfile.mkstemp(suffix=".wav")
         os.close(fd)
         try:
-            audio.build_dub_wav(job.audio_path, [(t / US, s / US, d / US) for t, s, d in placements],
+            audio.build_dub_wav(job.audio_path, [tuple(v / US for v in p) for p in placements],
                                 video_duration, wav)
 
             def on_progress(p, speed, eta):

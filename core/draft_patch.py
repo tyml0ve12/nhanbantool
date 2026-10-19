@@ -37,8 +37,47 @@ class LanguageTrack:
     name: str
     audio_path: str
     audio_duration_us: int
-    placements: list     # [(target_start_us, source_start_us, duration_us)]
+    placements: list     # [(target_start_us, source_start_us, duration_us, mute_head_us, mute_tail_us)]
     audible: bool
+
+
+# Keyframe am luong CapCut (KFTypeVolume): cung dinh dang Tool edit nhac da ghi va chay that
+# hang tram lan; values = he so tuyen tinh (1.0 = 100%).
+# time_offset (micro giay) tinh theo THOI GIAN TRONG FILE AUDIO (material), KHONG phai tu dau doan:
+# da xac nhan tren project 132 (2026-10-19) - ghi tu dau doan thi doan cat tu giay 0 cua file nghe duoc,
+# moi doan cat tu giua file deu CAM. (Tool edit nhac khong gap vi clip nhac thuong cat tu giay 0.)
+KF_VOLUME_TYPE = "KFTypeVolume"
+MUTE_RAMP_US = 10_000      # vuot 10ms o cho tat/mo tieng -> khong nghe tieng "tach"
+
+
+def _volume_keyframe(time_offset_us: int, value: float) -> dict:
+    return {"id": _new_id(), "curveType": "Line", "time_offset": int(time_offset_us),
+            "left_control": {"x": 0.0, "y": 0.0}, "right_control": {"x": 0.0, "y": 0.0},
+            "values": [float(value)], "string_value": "", "graphID": ""}
+
+
+def mute_keyframes(duration_us: int, mute_head_us: int, mute_tail_us: int, source_start_us: int) -> list:
+    """Keyframe am luong cho 1 doan: tat (0) phan keo dai dau/cuoi, 100% o giua. [] neu khong can.
+    source_start_us: doan cat tu dau trong file audio - time_offset = source_start_us + vi tri trong doan."""
+    points = []
+    if mute_head_us > 0:
+        on = min(duration_us, mute_head_us + MUTE_RAMP_US)
+        points += [(0, 0.0), (mute_head_us, 0.0), (on, 1.0)]
+    if mute_tail_us > 0:
+        off = duration_us - mute_tail_us
+        points += [(max(off - MUTE_RAMP_US, points[-1][0] if points else 0), 1.0), (off, 0.0), (duration_us, 0.0)]
+    if not points:
+        return []
+    # Luon co diem o 2 mep doan -> khong phu thuoc cach CapCut ngoai suy truoc diem dau / sau diem cuoi
+    if points[0][0] > 0:
+        points.insert(0, (0, 1.0))
+    if points[-1][0] < duration_us:
+        points.append((duration_us, 1.0))
+    by_offset = {}
+    for t, v in points:
+        by_offset[int(t)] = v            # trung vi tri -> diem sau thang
+    kfs = [_volume_keyframe(source_start_us + t, v) for t, v in sorted(by_offset.items())]
+    return [{"id": _new_id(), "material_id": "", "property_type": KF_VOLUME_TYPE, "keyframe_list": kfs}]
 
 
 def _new_id() -> str:
@@ -113,7 +152,9 @@ def build_dubbed_draft(draft: dict, track_index: int, languages: list) -> dict:
         new_track["is_default_name"] = False
         new_track["segments"] = []
 
-        for target_us, source_us, dur_us in lang.placements:
+        for placement in lang.placements:
+            target_us, source_us, dur_us = placement[:3]
+            mute_head, mute_tail = (placement[3], placement[4]) if len(placement) >= 5 else (0, 0)
             seg = copy.deepcopy(template_seg)
             seg["id"] = _new_id()
             seg["material_id"] = material["id"]
@@ -124,8 +165,13 @@ def build_dubbed_draft(draft: dict, track_index: int, languages: list) -> dict:
             seg["speed"] = 1.0
             if "track_render_index" in seg:
                 seg["track_render_index"] = track_pos
+            # Khong mang theo keyframe / "Ro dan-Mo dan" (audio_fades) cua doan goc lam mau: chung se
+            # chong len keyframe tat tieng cua tool (Tool edit nhac da gap: CapCut ap dung ca hai).
+            seg["common_keyframes"] = mute_keyframes(int(dur_us), int(mute_head), int(mute_tail), int(source_us))
+            if "keyframe_refs" in seg:
+                seg["keyframe_refs"] = []
             seg["extra_material_refs"] = _clone_refs(template_seg.get("extra_material_refs", []),
-                                                     index, materials)
+                                                     index, materials, skip_kinds={"audio_fades"})
             new_track["segments"].append(seg)
         # Chi 1 ngon ngu bat tieng; cac ngon ngu khac tat bang nut tat tieng track
         set_track_muted(new_track, not lang.audible)
@@ -176,12 +222,14 @@ def _remove_previous_dub_tracks(d: dict, orig_track: dict, names: set):
             d["materials"][key] = [e for e in value if not (isinstance(e, dict) and e.get("id") in drop)]
 
 
-def _clone_refs(ref_ids, index, materials) -> list:
+def _clone_refs(ref_ids, index, materials, skip_kinds=()) -> list:
     new_ids = []
     for ref in ref_ids:
         if ref not in index:
             continue
         key, entry = index[ref]
+        if key in skip_kinds:
+            continue
         clone = copy.deepcopy(entry)
         clone["id"] = _new_id()
         materials[key].append(clone)
