@@ -60,12 +60,13 @@ def mute_keyframes(duration_us: int, mute_head_us: int, mute_tail_us: int, sourc
     """Keyframe am luong cho 1 doan: tat (0) phan keo dai dau/cuoi, 100% o giua. [] neu khong can.
     source_start_us: doan cat tu dau trong file audio - time_offset = source_start_us + vi tri trong doan."""
     points = []
+    off = duration_us - mute_tail_us
+    # Vung nghe duoc ngan hon 2 lan vuot -> vuot ngan lai (moi ben toi da nua vung), giu thu tu diem tang dan
+    ramp = min(MUTE_RAMP_US, max(0, (off - mute_head_us) // 2))
     if mute_head_us > 0:
-        on = min(duration_us, mute_head_us + MUTE_RAMP_US)
-        points += [(0, 0.0), (mute_head_us, 0.0), (on, 1.0)]
+        points += [(0, 0.0), (mute_head_us, 0.0), (mute_head_us + ramp, 1.0)]
     if mute_tail_us > 0:
-        off = duration_us - mute_tail_us
-        points += [(max(off - MUTE_RAMP_US, points[-1][0] if points else 0), 1.0), (off, 0.0), (duration_us, 0.0)]
+        points += [(off - ramp, 1.0), (off, 0.0), (duration_us, 0.0)]
     if not points:
         return []
     # Luon co diem o 2 mep doan -> khong phu thuoc cach CapCut ngoai suy truoc diem dau / sau diem cuoi

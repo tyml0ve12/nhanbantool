@@ -134,7 +134,8 @@ def _mute_edges(data: bytes, head_frames: int, tail_frames: int, ramp_ms: int = 
     x = np.frombuffer(data, dtype=np.int16).reshape(-1, CHANNELS).astype(np.float32)
     n = len(x)
     env = np.ones(n, dtype=np.float32)
-    ramp = int(SAMPLE_RATE * ramp_ms / 1000)
+    # vung nghe duoc ngan hon 2 lan vuot -> vuot ngan lai (giong mute_keyframes trong draft)
+    ramp = min(int(SAMPLE_RATE * ramp_ms / 1000), max(0, (n - max(0, head_frames) - max(0, tail_frames)) // 2))
     if head_frames > 0:
         h = min(n, head_frames)
         env[:h] = 0

@@ -250,8 +250,16 @@ class RunWorker(QThread):
             log.info("Khong tim thay file giong goc: %s", ", ".join(missing))
         if not words_by_file:
             return None
+        # Luc giong goc bat dau noi: do bang nang luong (cung thuoc voi giong moi), whisper chi de du phong
+        levels_by_file = {}
+        for path in words_by_file:
+            try:
+                levels_by_file[path] = audio.levels_db(path)
+            except audio.AudioError as e:
+                log.warning("Khong do duoc am luong giong goc %s: %s -> dung moc whisper", path, e)
         self._onset_src = []
-        self._onsets = pipeline.original_onsets(clips, sources, words_by_file, self._onset_src)
+        self._onsets = pipeline.original_onsets(clips, sources, words_by_file, self._onset_src,
+                                                levels_by_file, audio.LEVEL_FRAME_SEC)
         return pipeline.original_texts(clips, sources, words_by_file)
 
     def _embed(self):
@@ -321,14 +329,15 @@ class RunWorker(QThread):
         for k, i in enumerate(self._order):
             by_clip[i] = result.sentences[k]
         # Cat o cho lang nhat giua 2 cau (giu tron chu dau/cuoi), keo dai 0.5s moi dau (phan lan sang
-        # cau ben canh tat tieng), luc bat dau noi = luc giong goc bat dau noi.
+        # cau ben canh tat tieng), luc bat dau noi = luc giong goc bat dau noi (ca 2 do bang nang luong).
         span_dbg, place_dbg = {}, []
         spans = pipeline.voice_spans(result.sentences, audio.levels_db(job.audio_path), audio.LEVEL_FRAME_SEC, dur,
                                      span_dbg)
         onsets = getattr(self, "_onsets", None)
         placements, report = pipeline.compute_placements(by_clip, clips, timeline_end, spans, onsets, place_dbg)
         self.log.emit(f"[{job.name}] Mỗi câu kéo dài {pipeline.EXTEND_SEC:g}s hai đầu (phần lấn câu bên cạnh tắt tiếng); "
-                      "lúc bắt đầu nói căn theo " + ("giọng gốc." if onsets else "mép câu gốc (không có file giọng gốc)."))
+                      "lúc bắt đầu nói căn theo " + ("giọng gốc (đo theo âm lượng)." if onsets
+                                                     else "mép câu gốc (không có file giọng gốc)."))
         for first, second in result.merged:
             self.log.emit(f"[{job.name}] Câu {first} + {second} được đọc liền thành 1 câu → đặt ở vị trí câu "
                           f"{first}, câu {second} không có tiếng riêng.")
@@ -384,11 +393,15 @@ class RunWorker(QThread):
         log.info("[%s] CHI TIET | noi dung cau goc: %s%s | onset: %s", name,
                  ", ".join(f"{k} {v}" for k, v in counts.items()),
                  f" (cau bu: {', '.join(map(str, filled))})" if filled else "",
-                 "whisper giong goc" if self._onsets else "mep clip (khong co file giong goc)")
-        # Canh bao theo tung cau (so thu tu tren timeline); canh bao khong ghi so cau -> ghi rieng
+                 "giong goc (nang luong, whisper du phong)" if self._onsets else "mep clip (khong co file giong goc)")
+        # Canh bao theo tung cau (so thu tu tren timeline): so cau o DAU canh bao ("Câu x" / "Câu x + y"), canh bao
+        # lech > 5s liet ke "câu x (+d s)"; canh bao khong ghi so cau -> ghi rieng
         per_sentence = {}
         for w in result.warnings:
-            nums = {int(x) for x in re.findall(r"[Cc]âu (\d+)", w)} | {int(x) for x in re.findall(r"\+ (\d+) ", w)}
+            head = re.match(r"Câu (\d+)(?: \+ (\d+))?", w)
+            nums = {int(x) for x in head.groups() if x} if head else set()
+            if "lệch mốc gốc" in w:
+                nums |= {int(x) for x in re.findall(r"câu (\d+) \(", w)}
             if not nums:
                 log.info("[%s] CHI TIET | canh bao chung: %s", name, w)
             for k in nums:
@@ -408,6 +421,9 @@ class RunWorker(QThread):
             row = [f"[{name}] cau {label}"]
             onset = (f"{self._onsets[i]:.3f} ({self._onset_src[i]})" if self._onsets and self._onset_src
                      else "0 (mep clip, khong co giong goc)")
+            onset_kind = ("mep_clip" if not (self._onsets and self._onset_src) else
+                          "nang_luong" if self._onset_src[i].startswith("nang luong") else
+                          "whisper" if self._onset_src[i].startswith("du phong") else "mep_clip")
             row.append(f"goc tl={sec(c.target_start_us):.3f}-{sec(c.target_start_us + c.target_duration_us):.3f}"
                        f" src={sec(c.source_start_us):.3f}-{sec(c.source_start_us + c.source_duration_us):.3f}"
                        f" file={os.path.basename(c.source_path.replace(chr(92), '/'))} onset={onset}")
@@ -424,8 +440,9 @@ class RunWorker(QThread):
                 v, sd = spans.get(id(s)), span_dbg.get(id(s), {})
                 if v is not None:
                     row.append(f"nghe_duoc={v.audible_start:.3f}-{v.audible_end:.3f}"
-                               f" cho_cat_dau={sd.get('cut_start', '?')} {sd.get('db_start', float('nan')):+.1f}dB"
+                               f" cho_cat_dau={sd.get('cut_start', '?')} {sd.get('db_start', float('nan')):+.1f}dB(so floor)"
                                f" cho_cat_cuoi={sd.get('cut_end', '?')} {sd.get('db_end', float('nan')):+.1f}dB(so floor)"
+                               f" nguong={sd.get('threshold', float('nan')):+.1f}dB(so floor)"
                                f" noi={v.speech_start:.3f}({'nang_luong' if sd.get('onset_by_energy') else '=cat_cu'})"
                                f"-{v.speech_end:.3f}({'nang_luong' if sd.get('offset_by_energy') else '=cat_cu'})"
                                f" keo_dai={v.ext_start:.3f}-{v.ext_end:.3f}")
@@ -434,8 +451,9 @@ class RunWorker(QThread):
                     row.append(f"dat tl={sec(target):.3f} src={sec(source):.3f} dur={sec(duration):.3f}"
                                f" tat_dau={sec(mute_head):.3f} tat_cuoi={sec(mute_tail):.3f}"
                                f" noi_tl={sec(pd['speech_us']):.3f} goc_noi_tl={sec(pd['onset_us']):.3f}"
-                               f" delta={sec(pd['speech_us'] - pd['onset_us']):+.3f}"
+                               f" delta_vs_{onset_kind}={sec(pd['speech_us'] - pd['onset_us']):+.3f}"
                                f" TH1={sec(pd['th1_us']):+.3f} TH2={sec(pd['th2_us']):+.3f}"
+                               f" rut_nghe_duoc={sec(pd['aud_head_cut_us']):.3f}/{sec(pd['aud_tail_cut_us']):.3f}"
                                f" rut_keo_dai={sec(pd['head_cut_us']):.3f}/{sec(pd['tail_cut_us']):.3f}"
                                + (f" bo_lang_dau={sec(pd['trim_start_us']):.3f}" if pd["trim_start_us"] else ""))
             for w in per_sentence.get(label, []):
