@@ -185,6 +185,10 @@ class VoiceSpan:
     audible_end: float       # cho lang nhat giua cau nay va cau sau (het nghe duoc)
     ext_start: float         # mep doan keo dai (speech_start - 0.5s)
     ext_end: float           # (speech_end + 0.5s)
+    # Khung con AM (> SOUND_BELOW_PEAK_DB) dau tien / cuoi cung trong vung nghe duoc: am nhe / tieng bat cuoi chu
+    # thap hon nguong luc noi. LOI cua TH1 luon bao tron [sound_start, sound_end] -> khong bao gio rut mat am.
+    sound_start: float = None
+    sound_end: float = None
 
 
 SPEECH_ABOVE_FLOOR_DB = 10   # khung to hon nen (khung 10% nho nhat cua file) muc nay moi co the la tieng noi
@@ -195,6 +199,10 @@ SPEECH_ABOVE_FLOOR_DB = 10   # khung to hon nen (khung 10% nho nhat cua file) mu
 SPEECH_BELOW_PEAK_DB = 25
 SPEECH_MIN_FRAMES = 3        # >= 3 khung 10ms lien tiep co tieng moi tinh (bo tieng tach / tho ngan)
 TH1_MARGIN_SEC = 0.15        # TH1/TH2 tinh tren tieng noi + le 0.15s moi ben (khong phai ca vung nghe duoc)
+# ... nhung LOI luon bao tron moi khung con am (> dinh - 35 dB, 1 khung du) + 50ms: duoi am thap / tieng bat
+# ngan (< 3 khung) sau luc het noi khong bi rut mat khi TH1 phai rut phan nghe duoc (QA 8-A: 107 day cau 9 mat "d").
+SOUND_BELOW_PEAK_DB = 35
+SOUND_PAD_SEC = 0.05
 
 
 def speech_threshold(levels, floor: float, fa: int, fb: int) -> float:
@@ -283,7 +291,15 @@ def voice_spans(sentences: list, levels, frame_sec: float, audio_duration: float
         speech_start, speech_end = max(a, speech_start), min(b, max(speech_end, speech_start))
         ext_start = max(0.0, min(a, speech_start - EXTEND_SEC))
         ext_end = min(audio_duration, max(b, speech_end + EXTEND_SEC))
-        spans[id(s)] = VoiceSpan(a, speech_start, speech_end, b, ext_start, ext_end)
+        # con am (nguong thap hon, 1 khung du): tu dau vung toi luc bat dau noi / tu luc het noi toi cuoi vung
+        # (khong ap nen + 10 dB: file nen cao -> moi khung deu tinh la con am -> loi = ca vung nghe duoc, khong rut gi)
+        fa, fs, fe, fb = frame(a), frame(speech_start), frame(speech_end), frame(b)
+        sound = float(np.percentile(levels[fa:fb + 1], 95)) - SOUND_BELOW_PEAK_DB if len(levels) else 0.0
+        first = next((i for i in range(fa, fs) if levels[i] > sound), None) if len(levels) else None
+        last = next((i for i in range(fb, fe - 1, -1) if levels[i] > sound), None) if len(levels) else None
+        sound_start = min(speech_start, first * frame_sec) if first is not None else speech_start
+        sound_end = max(speech_end, (last + 1) * frame_sec) if last is not None else speech_end
+        spans[id(s)] = VoiceSpan(a, speech_start, speech_end, b, ext_start, ext_end, sound_start, sound_end)
         if debug is not None and len(levels):
             debug[id(s)] = dict(
                 cut_start=cut_how[k - 1] if k > 0 else "mep (-0.5s)",
@@ -361,12 +377,16 @@ def compute_placements(sentences: list, clips: list, timeline_end_us: int,
     if spans is None:
         spans = {id(s): VoiceSpan(s.start, s.start, s.end, s.end, s.start, s.end) for s in sentences}
     sp = [spans[id(s)] for s in sentences]
-    margin = int(round(TH1_MARGIN_SEC * US))
+    margin, pad = int(round(TH1_MARGIN_SEC * US)), int(round(SOUND_PAD_SEC * US))
     aud_start = [int(round(v.audible_start * US)) for v in sp]
     aud_end = [max(a + 1, int(round(v.audible_end * US))) for v, a in zip(sp, aud_start)]
-    # LOI = [bat dau noi - le, het noi + le] trong vung nghe duoc; vi tri tren timeline tinh theo loi
-    src_start = [max(a, int(round(v.speech_start * US)) - margin) for v, a in zip(sp, aud_start)]
-    lengths = [max(1, min(e, int(round(v.speech_end * US)) + margin) - s) for v, s, e in zip(sp, src_start, aud_end)]
+    # LOI = [bat dau noi - le, het noi + le] + moi khung con am (+50ms), trong vung nghe duoc; vi tri tren timeline tinh theo loi
+    src_start = [max(a, min(int(round(v.speech_start * US)) - margin,
+                            int(round((v.speech_start if v.sound_start is None else v.sound_start) * US)) - pad))
+                 for v, a in zip(sp, aud_start)]
+    lengths = [max(1, min(e, max(int(round(v.speech_end * US)) + margin,
+                                 int(round((v.speech_end if v.sound_end is None else v.sound_end) * US)) + pad)) - s)
+               for v, s, e in zip(sp, src_start, aud_end)]
     lead = [int(round(v.speech_start * US)) - s for v, s in zip(sp, src_start)]    # le truoc chu dau
     onset = [clips[i].target_start_us + int(round((onsets[i] if onsets else 0.0) * US)) for i in idx]
     origin = [o - l for o, l in zip(onset, lead)]
