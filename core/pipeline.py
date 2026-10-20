@@ -188,7 +188,7 @@ class VoiceSpan:
 SPEECH_ABOVE_FLOOR_DB = 10   # khung to hon nen (khung 10% nho nhat) muc nay = dang co tieng noi
 
 
-def voice_spans(sentences: list, levels, frame_sec: float, audio_duration: float) -> dict:
+def voice_spans(sentences: list, levels, frame_sec: float, audio_duration: float, debug: dict = None) -> dict:
     """Tinh VoiceSpan cho moi cau (theo thu tu trong file voice).
     Diem cat cu (s.start / s.end) nam trong KHOANG LANG THAT do ffmpeg do -> giu lam chuan va chi
     NOI RONG: giua 2 cau, cat o CHO LANG NHAT trong khoang [cuoi cau truoc, dau cau sau] cu
@@ -197,12 +197,16 @@ def voice_spans(sentences: list, levels, frame_sec: float, audio_duration: float
     KHONG dung moc tung chu cua whisper (lech nhieu voi tieng Phap / A Rap / Nhat: do tren bai 107,
     cat theo moc whisper lam cau cat vao giua tieng noi tang 0 -> 26..55 cau).
     Luc bat dau / het noi do bang nang luong (khung dau tien / cuoi cung co tieng).
+    debug (dict, tuy chon): dien them thong tin de ghi log chan doan - "floor" va
+    {id(sentence): {...}} (cach chon cho cat, muc dB cho cat...). Khong anh huong ket qua.
     Tra ve {id(sentence): VoiceSpan}."""
     present = sorted((s for s in sentences if s is not None), key=lambda s: s.start)
     if not present:
         return {}
     floor = float(sorted(levels)[len(levels) // 10]) if len(levels) else -100.0
     loud = levels > floor + SPEECH_ABOVE_FLOOR_DB
+    if debug is not None:
+        debug["floor"] = floor
 
     def frame(t):
         return min(len(levels) - 1, max(0, int(round(t / frame_sec))))
@@ -239,12 +243,25 @@ def voice_spans(sentences: list, levels, frame_sec: float, audio_duration: float
         ext_start = max(0.0, min(a, speech_start - EXTEND_SEC))
         ext_end = min(audio_duration, max(b, speech_end + EXTEND_SEC))
         spans[id(s)] = VoiceSpan(a, speech_start, speech_end, b, ext_start, ext_end)
+        if debug is not None and len(levels):
+            debug[id(s)] = dict(
+                cut_start=_cut_how(present, k - 1) if k > 0 else "mep (-0.5s)",
+                cut_end=_cut_how(present, k) if k + 1 < len(present) else "mep (+0.5s)",
+                db_start=float(levels[frame(a)]) - floor, db_end=float(levels[frame(b)]) - floor,
+                onset_by_energy=on is not None, offset_by_energy=off is not None)
     return spans
 
 
-def original_onsets(clips: list, source_map: dict, words_by_file: dict) -> list:
+def _cut_how(present, k) -> str:
+    """Cach chon cho cat giua cau k va k+1 trong voice_spans (chi de ghi log)."""
+    lo, hi = present[k].end, present[k + 1].start
+    return f"valley({hi - lo:.2f}s)" if hi > lo else "giua(hi<=lo)"
+
+
+def original_onsets(clips: list, source_map: dict, words_by_file: dict, debug: list = None) -> list:
     """Do tre tu mep dau clip goc toi luc giong goc bat dau noi (giay), theo chu dau tien
-    (whisper) nam trong clip. Khong co file giong goc -> 0 (coi mep clip la luc bat dau noi)."""
+    (whisper) nam trong clip. Khong co file giong goc -> 0 (coi mep clip la luc bat dau noi).
+    debug (list, tuy chon): them nguon cua tung onset de ghi log chan doan."""
     out = []
     for c in clips:
         words = words_by_file.get(source_map.get(c.source_path, ""), [])
@@ -252,11 +269,14 @@ def original_onsets(clips: list, source_map: dict, words_by_file: dict) -> list:
         b = a + c.source_duration_us / US
         inside = [w for w in words if w.text.strip() and a - 0.1 <= (w.start + w.end) / 2 <= b + 0.1]
         out.append(min(max(0.0, inside[0].start - a), c.source_duration_us / US) if inside else 0.0)
+        if debug is not None:
+            debug.append(f"whisper chu dau '{inside[0].text.strip()[:15]}' @{inside[0].start:.3f}s" if inside
+                         else ("mac dinh 0 (khong co chu)" if words else "mac dinh 0 (khong co file giong goc)"))
     return out
 
 
 def compute_placements(sentences: list, clips: list, timeline_end_us: int,
-                       spans: dict = None, onsets: list = None) -> tuple:
+                       spans: dict = None, onsets: list = None, debug: list = None) -> tuple:
     """Dat cau moi i vao moc cau goc i: LUC BAT DAU NOI cua cau moi = luc bat dau noi cua giong goc
     (mep clip goc + onsets[i]). KHONG BAO GIO CAT CAU, khong doi toc do; tranh 2 giong de nhau
     bang cach DICH VI TRI (quy tac da chot voi nguoi dung 2026-09-29), tinh tren VUNG NGHE DUOC:
@@ -269,6 +289,8 @@ def compute_placements(sentences: list, clips: list, timeline_end_us: int,
     nghe duoc se TAT TIENG. Dung doan ben canh tren timeline -> rut bot phan keo dai cho vua cham
     (phan rut bot chi la lang / da tat tieng).
     spans=None -> cach cu (cat dung [start, end], khong keo dai).
+    debug (list, tuy chon): them 1 dict / placement (chi so clip, TH1/TH2, phan keo dai bi rut...)
+    de ghi log chan doan. Khong anh huong ket qua.
     Tra ve ([(target_us, source_us, duration_us, mute_head_us, mute_tail_us)], PlacementReport)."""
     # Cau goc da GOP vao cau truoc (None, can 2:1) -> khong co doan rieng tren timeline
     idx = [i for i, s in enumerate(sentences[:len(clips)]) if s is not None]
@@ -287,6 +309,7 @@ def compute_placements(sentences: list, clips: list, timeline_end_us: int,
     # TH1: quet tu dau -> cuoi, day cau bi de ra sau
     for i in range(1, n):
         starts[i] = max(origin[i], starts[i - 1] + lengths[i - 1])
+    after_th1 = list(starts)
 
     # TH2: quet tu cuoi -> dau, keo cau vuot cuoi video (va cau bi de) som len
     if n and starts[-1] + lengths[-1] > timeline_end_us:
@@ -294,9 +317,12 @@ def compute_placements(sentences: list, clips: list, timeline_end_us: int,
         for i in range(n - 2, -1, -1):
             if starts[i] + lengths[i] > starts[i + 1]:
                 starts[i] = starts[i + 1] - lengths[i]
+    after_th2 = list(starts)
+    trimmed0 = 0
     if n and starts[0] < 0:
         # cau dau ra truoc 0 chi vi phan lang truoc chu dau -> bo bot phan lang do (khong dung chu)
         trim = -starts[0]
+        trimmed0 = trim
         if trim <= lead[0]:
             src_start[0] += trim
             lengths[0] -= trim
@@ -335,6 +361,11 @@ def compute_placements(sentences: list, clips: list, timeline_end_us: int,
     for i in range(n):
         placements.append((starts[i] - head[i], src_start[i] - head[i], lengths[i] + head[i] + tail[i],
                            head[i], tail[i]))
+        if debug is not None:
+            debug.append(dict(clip=idx[i], onset_us=onset[i], speech_us=starts[i] + lead[i],
+                              th1_us=after_th1[i] - origin[i], th2_us=after_th2[i] - after_th1[i],
+                              trim_start_us=trimmed0 if i == 0 else 0,
+                              head_cut_us=head_want[i] - head[i], tail_cut_us=tail_want[i] - tail[i]))
     return placements, report
 
 

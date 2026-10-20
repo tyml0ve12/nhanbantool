@@ -71,6 +71,9 @@ class Sentence:
     end: float
     text: str
     similarity: float = 0.0
+    # Chi de ghi log chan doan (khong anh huong ket qua): loai ranh gioi dau/cuoi cau
+    # (start_kind / end_kind) va do dai khoang ngung tai do (start_pause / end_pause)
+    debug: dict = field(default_factory=dict, repr=False, compare=False)
 
 
 @dataclass
@@ -81,6 +84,16 @@ class SegmentResult:
     used_meaning: bool
     warnings: list = field(default_factory=list)
     merged: list = field(default_factory=list)   # [(nhan cau dau, nhan cau bi gop)]
+    debug: dict = field(default_factory=dict)    # chi de ghi log chan doan (so cho ngat...)
+
+
+# Loai ranh gioi cau (ghi log chan doan)
+KIND_EDGE = "mep voice"            # dau / cuoi phan co tieng cua file
+KIND_SILENCE = "lang ffmpeg"       # khoang lang do duoc
+KIND_PUNCT = "dau cau whisper"     # dau cham cau whisper, khoang ngat qua ngan de do
+KIND_JOINED = "tach cap doc lien"  # 2 cau doc lien, tach tai ranh gioi tu
+KIND_REFINE = "refine doi"         # _refine_boundaries da doi ranh gioi
+KIND_OVERLAP = "+giua vi chong"    # 2 cau co le chong nhau -> dat ve diem giua
 
 
 def _speech_bounds(words, silences, duration):
@@ -153,6 +166,8 @@ def split_sentences(words, original_durations, silences, audio_duration,
     node_end = [t0] + [c[0] for c in cands] + [t1]       # tieng ket thuc tai node
     node_score = [0.0] + [c[2] for c in cands] + [0.0]
     last_node = len(node_start) - 1
+    measured = set(silences)
+    node_kind = [KIND_EDGE] + [KIND_SILENCE if (c[0], c[1]) in measured else KIND_PUNCT for c in cands] + [KIND_EDGE]
 
     orig_total = sum(original_durations)
     typical_pause = sorted((c[1] - c[0] for c in cands), reverse=True)[max(0, n - 2)]
@@ -238,11 +253,18 @@ def split_sentences(words, original_durations, silences, audio_duration,
                     sentences[k + j] = Sentence(start, end, _words_text(ws))
                     sent_words[k + j] = ws
                     expected[k + j] = original_durations[k + j]
+                gap = max(0.0, pair[1][0][0].start - pair[0][0][-1].end)
+                sentences[k].debug.update(start_kind=node_kind[a], start_pause=node_start[a] - node_end[a],
+                                          end_kind=KIND_JOINED, end_pause=gap)
+                sentences[k + 1].debug.update(start_kind=KIND_JOINED, start_pause=gap,
+                                              end_kind=node_kind[b], end_pause=node_start[b] - node_end[b])
                 joined.append((labels[k], labels[k + 1], f"{pair[0][0][-1].text.strip()} | {pair[1][0][0].text.strip()}"))
                 continue
         table = sim if step == 1 else sim2
         similarity = float(table[(a, b)][k]) if table else 0.0
         sentences[k] = Sentence(max(0.0, s - PAD_BEFORE), min(audio_duration, e + PAD_AFTER), _words_text(span_words), similarity)
+        sentences[k].debug.update(start_kind=node_kind[a], start_pause=node_start[a] - node_end[a],
+                                  end_kind=node_kind[b], end_pause=node_start[b] - node_end[b])
         sent_words[k] = span_words
         expected[k] = sum(original_durations[k:k + step])
         if step == 2:
@@ -261,6 +283,8 @@ def split_sentences(words, original_durations, silences, audio_duration,
     for x, y in zip(present, present[1:]):
         if sentences[x].end > sentences[y].start:
             sentences[x].end = sentences[y].start = (sentences[x].end + sentences[y].start) / 2
+            sentences[x].debug["end_kind"] = sentences[x].debug.get("end_kind", "") + KIND_OVERLAP
+            sentences[y].debug["start_kind"] = sentences[y].debug.get("start_kind", "") + KIND_OVERLAP
 
     if use_meaning:
         low = sorted(labels[k] for k in present if sentences[k].similarity < LOW_SIMILARITY)
@@ -286,7 +310,9 @@ def split_sentences(words, original_durations, silences, audio_duration,
         elif abs(math.log(max(0.05, sent.end - sent.start) / (ratio * od))) > OUTLIER_LOG_RATIO:
             warnings.append(f"Câu {labels[k]} dài {sent.end - sent.start:.1f}s, lệch nhiều so với câu gốc "
                             f"({od:.1f}s) — nên nghe kiểm tra.")
-    return SegmentResult(sentences, corr, ratio, use_meaning, warnings, merged)
+    debug = dict(pauses=len(cands), silence_pauses=sum(1 for x in node_kind[1:-1] if x == KIND_SILENCE),
+                 speech_start=t0, speech_end=t1)
+    return SegmentResult(sentences, corr, ratio, use_meaning, warnings, merged, debug)
 
 
 def _align_iter(n, node_start, node_end, node_score, original_durations, ratio, sim, sim2, orig_total, merge_cost):
@@ -469,6 +495,9 @@ def _refine_boundaries(present, sentences, sent_words, texts, expected, ratio, e
         cut_end, cut_start = _cut_times(new_x[-1], new_y[0])
         sentences[x].end, sentences[x].text = cut_end, _words_text(new_x)
         sentences[y].start, sentences[y].text = cut_start, _words_text(new_y)
+        gap = max(0.0, new_y[0].start - new_x[-1].end)
+        sentences[x].debug.update(end_kind=KIND_REFINE, end_pause=gap)
+        sentences[y].debug.update(start_kind=KIND_REFINE, start_pause=gap)
         moved += 1
     return moved
 

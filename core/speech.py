@@ -22,6 +22,7 @@ log = logging.getLogger("speech")
 CACHE_VERSION = 2
 GPU_BATCH_SIZE = 16
 CPU_BATCH_SIZE = 8
+COMPUTE_TYPE = {"cuda": "float16", "cpu": "int8"}   # kieu tinh cua whisper theo thiet bi
 
 
 @dataclass
@@ -97,13 +98,13 @@ def load_model(model: str, device: str, on_log: Callable[[str], None]):
     common = dict(download_root=get_models_dir(), local_files_only=local_only)
     if device == "cuda":
         try:
-            m = WhisperModel(model, device="cuda", compute_type="float16", **common)
+            m = WhisperModel(model, device="cuda", compute_type=COMPUTE_TYPE["cuda"], **common)
             _warm_up(m)
             return m, "cuda"
         except Exception as e:
             log.warning("Khong chay duoc whisper tren GPU: %s", e)
             on_log(f"Không chạy được trên GPU ({_short(e)}) → chuyển sang CPU.")
-    m = WhisperModel(model, device="cpu", compute_type="int8", **common)
+    m = WhisperModel(model, device="cpu", compute_type=COMPUTE_TYPE["cpu"], **common)
     return m, "cpu"
 
 

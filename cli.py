@@ -10,6 +10,7 @@ import sys
 
 from PySide6.QtCore import QCoreApplication
 
+from core.applog import setup_logging
 from core.capcut_project import ProjectError, load_project, language_name_from_file
 from core.parts import audio_files_in
 from core.speech import detect_device
@@ -29,6 +30,8 @@ def main():
     p.add_argument("--default", default="", help="Ngôn ngữ bật tiếng trong CapCut (mặc định: ngôn ngữ đầu)")
     p.add_argument("--model", default="large-v3-turbo", help="Model faster-whisper")
     args = p.parse_args()
+    # Ghi file log giong app (logs\nhanban_*.log) -> co log chi tiet tung cau de chan doan
+    print(f"Log: {setup_logging()}")
 
     try:
         info = load_project(args.project)
