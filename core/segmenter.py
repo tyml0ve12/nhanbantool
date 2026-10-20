@@ -21,6 +21,7 @@ import numpy as np
 
 SENTENCE_END_RE = re.compile(r"[.!?。！？…]+[\"'”’»)\]]*$")
 PHRASE_END_RE = re.compile(r"[.,;:!?…。！？、，»”’\"')\]-]+$")   # tu co dau cau bat ky o cuoi
+CLAUSE_END_RE = re.compile(r"[,;，；][\"'”’»)\]]*$")           # dau phay / cham phay (ket cum trong cau)
 
 MIN_PAUSE = 0.12          # cho ngat ngan hon muc nay khong lam ranh gioi (giay)
 # Audio doc qua lien mach (vd tieng A Rap: 128 khoang lang cho 131 cau) -> do lai khoang
@@ -45,6 +46,8 @@ MID_PHRASE_PENALTY = 0.3
 MERGE_MAX_INNER_PAUSE = 0.5   # doan gop 2 cau co cho ngung >= muc nay o khoang giua -> nguoi doc van tach 2 cau, khong gop
 REFINE_SIM_WEIGHT = 6.0       # tinh chinh ranh gioi: trong so do giong cau con sat ranh gioi voi dau/duoi phu de
 REFINE_MIN_GAIN = 0.5         # chi doi ranh gioi khi tot hon ro rang
+REFINE_CLAUSE_RANGE = 2.0     # cau lech do dai: cho doi ranh gioi toi cho ngung sau dau phay / dau cau trong +-2s
+REFINE_PAUSE_SLACK = 0.35     # moc chu whisper lech -> tim khoang lang quanh 2 chu o ranh gioi trong +-0.35s
 
 MIN_CORRELATION = 0.60    # do khop do dai duoi muc nay -> bao loi
 WARN_CORRELATION = 0.80
@@ -93,6 +96,7 @@ KIND_SILENCE = "lang ffmpeg"       # khoang lang do duoc
 KIND_PUNCT = "dau cau whisper"     # dau cham cau whisper, khoang ngat qua ngan de do
 KIND_JOINED = "tach cap doc lien"  # 2 cau doc lien, tach tai ranh gioi tu
 KIND_REFINE = "refine doi"         # _refine_boundaries da doi ranh gioi
+KIND_REFINE_CLAUSE = "refine doi (cau lech do dai)"   # doi toi cho ngung co dau cau, vi cau lech do dai
 KIND_OVERLAP = "+giua vi chong"    # 2 cau co le chong nhau -> dat ve diem giua
 
 
@@ -270,8 +274,10 @@ def split_sentences(words, original_durations, silences, audio_duration,
         if step == 2:
             merged.append((labels[k], labels[k + 1]))
     present = [k for k in range(n) if sentences[k] is not None]
+    refine_log = []
     if use_meaning:
-        moved = _refine_boundaries(present, sentences, sent_words, texts, expected, ratio, embedder)
+        moved = _refine_boundaries(present, sentences, sent_words, texts, expected, ratio, embedder,
+                                   silences=silences, moves=refine_log)
         if on_log and moved:
             on_log(f"Tinh chỉnh ranh giới {moved} chỗ theo nội dung đầu/cuối câu.")
         # do giong nghia theo noi dung cuoi cung (sau khi tach / tinh chinh); cau con gop -> so voi ca 2 cau goc
@@ -311,7 +317,8 @@ def split_sentences(words, original_durations, silences, audio_duration,
             warnings.append(f"Câu {labels[k]} dài {sent.end - sent.start:.1f}s, lệch nhiều so với câu gốc "
                             f"({od:.1f}s) — nên nghe kiểm tra.")
     debug = dict(pauses=len(cands), silence_pauses=sum(1 for x in node_kind[1:-1] if x == KIND_SILENCE),
-                 speech_start=t0, speech_end=t1)
+                 speech_start=t0, speech_end=t1,
+                 refine=[dict(m, labels=(labels[m["x"]], labels[m["y"]])) for m in refine_log])
     return SegmentResult(sentences, corr, ratio, use_meaning, warnings, merged, debug)
 
 
@@ -442,12 +449,13 @@ def _split_joined(ws, start, end, originals, ratio, pair_texts, embedder):
     return [(ws[:i], start, cut_end), (ws[i:], cut_start, end)]
 
 
-def _chunks(ws):
-    """Chia cac tu cua 1 cau moi thanh cac cau con theo dau ket cau."""
+def _chunks(ws, clauses=False):
+    """Chia cac tu cua 1 cau moi thanh cac cau con theo dau ket cau (clauses=True: ca dau phay / cham phay)."""
     out, cur = [], []
     for w in ws:
         cur.append(w)
-        if SENTENCE_END_RE.search(w.text.strip()):
+        t = w.text.strip()
+        if SENTENCE_END_RE.search(t) or (clauses and CLAUSE_END_RE.search(t)):
             out.append(cur)
             cur = []
     if cur:
@@ -455,12 +463,30 @@ def _chunks(ws):
     return out
 
 
-def _refine_boundaries(present, sentences, sent_words, texts, expected, ratio, embedder) -> int:
+def _pause_between(silences, t0, t1) -> tuple:
+    """Khoang lang dai nhat (s, e) nam giua 2 moc [t0, t1] (moc chu whisper, cho lech +-REFINE_PAUSE_SLACK); (None, None, 0)."""
+    best = (None, None, 0.0)
+    for s, e in silences:
+        if s < t1 + REFINE_PAUSE_SLACK and e > t0 - REFINE_PAUSE_SLACK and e - s > best[2]:
+            best = (s, e, e - s)
+    return best
+
+
+def _is_outlier(length, original, ratio) -> bool:
+    """Cau lech do dai nhieu (giong canh bao "lech nhieu so voi cau goc")."""
+    return abs(math.log(max(0.05, length) / (ratio * original))) > OUTLIER_LOG_RATIO
+
+
+def _refine_boundaries(present, sentences, sent_words, texts, expected, ratio, embedder,
+                       silences=None, moves=None) -> int:
     """Buoc so nghia chinh tinh diem ca doan dai voi ca doan dai -> kem nhay voi 1 cau
     con o sat ranh gioi (vd "Towering around the water are rows of date palms." thuoc
     DAU cau sau nhung bi xep vao CUOI cau truoc). Voi tung ranh gioi, thu dua cau con
     cuoi cua cau truoc sang cau sau (hoac nguoc lai), so cau con do voi DUOI phu de cau
     truoc va DAU phu de cau sau (cung so chu), cong them thay doi do dai; doi neu ro rang tot hon.
+    Them (2026-10-20, 41.My cau 4|5 "a king, cast out for | his difference,"): ranh gioi cua cau LECH DO DAI
+    (dang bi canh bao) va cach cu khong doi -> thu ca cum ket bang dau phay / cham phay trong +-2s
+    (_refine_clause). silences: [(s, e)] cac cho ngat; moves: list nhan chi tiet cac lan doi (ghi log).
     Tra ve so ranh gioi da doi."""
     moved = 0
     for x, y in zip(present, present[1:]):
@@ -489,6 +515,9 @@ def _refine_boundaries(present, sentences, sent_words, texts, expected, ratio, e
             if gain > REFINE_MIN_GAIN and (best is None or gain > best[0]):
                 best = (gain, new_x, new_y)
         if best is None:
+            if silences is not None and _refine_clause(x, y, sentences, sent_words, texts, expected, ratio,
+                                                       embedder, silences, sub_x, sub_y, words_per_sec, moves):
+                moved += 1
             continue
         _, new_x, new_y = best
         sent_words[x], sent_words[y] = new_x, new_y
@@ -500,6 +529,64 @@ def _refine_boundaries(present, sentences, sent_words, texts, expected, ratio, e
         sentences[y].debug.update(start_kind=KIND_REFINE, start_pause=gap)
         moved += 1
     return moved
+
+
+def _refine_clause(x, y, sentences, sent_words, texts, expected, ratio, embedder, silences, sub_x, sub_y,
+                   words_per_sec, moves) -> bool:
+    """Ranh gioi x|y cua cau LECH DO DAI: thu doi toi cho ngung sau dau phay / dau ket cau trong +-2s. Chi doi khi:
+    (a) nghia cum o mep khop ro hon (REFINE_SIM_WEIGHT * chenh lech >= REFINE_MIN_GAIN, so CUC BO voi duoi / dau
+    cau goc nhu buoc tren, khong tinh do dai - do dai mong doi tinh theo ca clip goc nen chinh no lam cat sai);
+    (b) cho ngung moi DAI HON cho cu; (c) x hoac y dang lech do dai; (d) so cau lech do dai cua cap KHONG TANG
+    (41.My: truoc lech cau 5 "for his difference," 1.0s/2.5s; sau lech cau 4 "a king," 0.8s/1.9s vi clip goc cau 4
+    chi 30% la tieng noi - van 1 cau, chap nhan)."""
+    xw, yw = sent_words[x], sent_words[y]
+    len_x, len_y = sentences[x].end - sentences[x].start, sentences[y].end - sentences[y].start
+    out_x, out_y = _is_outlier(len_x, expected[x], ratio), _is_outlier(len_y, expected[y], ratio)
+    if not (out_x or out_y):
+        return False
+    old_cut = (sentences[x].end + sentences[y].start) / 2
+    old_pause = _pause_between(silences, sentences[x].end - PAD_AFTER, sentences[y].start + PAD_BEFORE)[2]
+    cx, cy = _chunks(xw, clauses=True), _chunks(yw, clauses=True)
+    options = []    # (cum doi, huong, tu cau x moi, tu cau y moi); tu nam o ca 2 cau (khung +-0.3s) chi giu 1 lan
+    for j in range(1, len(cx)):          # cac cum cuoi cua x -> dau y
+        keep, chunk = [w for c in cx[:j] for w in c], [w for c in cx[j:] for w in c]
+        options.append((chunk, -1, keep, chunk + [w for w in yw if not any(w is c for c in chunk)]))
+    for j in range(1, len(cy)):          # cac cum dau cua y -> cuoi x
+        chunk, rest = [w for c in cy[:j] for w in c], [w for c in cy[j:] for w in c]
+        options.append((chunk, 1, [w for w in xw if not any(w is c for c in chunk)] + chunk, rest))
+    best = None
+    for chunk, direction, new_x, new_y in options:
+        s, e, pause = _pause_between(silences, new_x[-1].end, new_y[0].start)
+        if s is None or pause <= old_pause or abs((s + e) / 2 - old_cut) > REFINE_CLAUSE_RANGE:     # (b), +-2s
+            continue
+        nx_end, ny_start = s + PAD_AFTER, e - PAD_BEFORE
+        if nx_end <= sentences[x].start or ny_start >= sentences[y].end:
+            continue
+        if (_is_outlier(nx_end - sentences[x].start, expected[x], ratio)
+                + _is_outlier(sentences[y].end - ny_start, expected[y], ratio)) > (out_x + out_y):    # (d)
+            continue
+        m = max(3, round(words_per_sec * (chunk[-1].end - chunk[0].start)))
+        vec = embedder.encode([_words_text(chunk), " ".join(sub_x[-m:]), " ".join(sub_y[:m])])
+        tail, head = float(vec[0] @ vec[1]), float(vec[0] @ vec[2])
+        sim_gain = (head - tail) if direction < 0 else (tail - head)
+        if REFINE_SIM_WEIGHT * sim_gain >= REFINE_MIN_GAIN and (best is None or sim_gain > best[0]):     # (a)
+            best = (sim_gain, new_x, new_y, nx_end, ny_start, pause, tail, head, _words_text(chunk))
+    if best is None:
+        return False
+    sim_gain, new_x, new_y, nx_end, ny_start, pause, tail, head, chunk_text = best
+    if moves is not None:
+        moves.append(dict(x=x, y=y, old=(_words_text(xw)[-40:], _words_text(yw)[:40]),
+                          new=(_words_text(new_x)[-40:], _words_text(new_y)[:40]), chunk=chunk_text,
+                          sim_tail=tail, sim_head=head, gain=REFINE_SIM_WEIGHT * sim_gain,
+                          pause_old=old_pause, pause_new=pause, cut_old=old_cut, cut_new=(nx_end + ny_start) / 2,
+                          len_old=(len_x, len_y), len_new=(nx_end - sentences[x].start, sentences[y].end - ny_start),
+                          expected=(ratio * expected[x], ratio * expected[y])))
+    sent_words[x], sent_words[y] = new_x, new_y
+    sentences[x].end, sentences[x].text = nx_end, _words_text(new_x)
+    sentences[y].start, sentences[y].text = ny_start, _words_text(new_y)
+    sentences[x].debug.update(end_kind=KIND_REFINE_CLAUSE, end_pause=pause)
+    sentences[y].debug.update(start_kind=KIND_REFINE_CLAUSE, start_pause=pause)
+    return True
 
 
 def _inner_pause(a, b, node_start, node_end) -> float:

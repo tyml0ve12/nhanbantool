@@ -406,6 +406,13 @@ class RunWorker(QThread):
                 log.info("[%s] CHI TIET | canh bao chung: %s", name, w)
             for k in nums:
                 per_sentence.setdefault(k, []).append(w)
+        for m in dbg.get("refine", []):
+            log.info("[%s] CHI TIET | doi ranh gioi cau %s|%s (cau lech do dai): '%s' | '%s' -> '%s' | '%s' | cum '%s':"
+                     " nghia duoi cau truoc %.3f / dau cau sau %.3f (diem %+.2f) | ngung %.2fs -> %.2fs | cat %.3f -> %.3fs"
+                     " | do dai %.2f/%.2fs -> %.2f/%.2fs (mong %.2f/%.2fs)", name, m["labels"][0], m["labels"][1],
+                     m["old"][0], m["old"][1], m["new"][0], m["new"][1], m["chunk"], m["sim_tail"], m["sim_head"], m["gain"],
+                     m["pause_old"], m["pause_new"], m["cut_old"], m["cut_new"], m["len_old"][0], m["len_old"][1],
+                     m["len_new"][0], m["len_new"][1], m["expected"][0], m["expected"][1])
         merged_into = {second: first for first, second in result.merged}
         by_place = {d["clip"]: (p, d) for p, d in zip(placements, place_dbg)}
 
