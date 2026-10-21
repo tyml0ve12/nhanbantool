@@ -318,6 +318,10 @@ SOUND_PAD_SEC = 0.05
 # ve mau song cau ben canh o 2 dau clip (viec #7, 2026-10-21). Nguong = thap hon cua "con am" cau ben canh (dinh vung
 # cau do - 35 dB) va nen + 10 dB: chi dung "con am" con sot tieng tho/duoi am +11..18 dB tren nen (41: 76/124 clip).
 EXT_GUARD_SEC = 0.025
+# ... nhung mep nghe duoc nam giua tieng TO (> nen + 20 dB, vd cap doc lien tach theo moc chu) van giu phan keo dai
+# >= 10ms: con doan vuot keyframe 0 -> 100% (draft_patch.MUTE_RAMP_US), CapCut khong phat/ngat dot ngot (QA 15-1)
+EXT_MIN_RAMP_SEC = 0.010
+EXT_LOUD_EDGE_DB = 20
 
 
 def speech_threshold(levels, floor: float, fa: int, fb: int) -> float:
@@ -422,6 +426,13 @@ def voice_spans(sentences: list, levels, frame_sec: float, audio_duration: float
             loud = [i for i in range(frame(b) + 1, frame(ext_end) + 1) if levels[i] > guard[k + 1]]
             if loud:
                 ext_end = max(b, loud[0] * frame_sec - EXT_GUARD_SEC)
+        if len(levels):
+            def loud_edge(t):
+                return float(levels[max(0, frame(t) - 2):frame(t) + 3].max()) > floor + EXT_LOUD_EDGE_DB
+            if ext_start > a - EXT_MIN_RAMP_SEC and ext_full[0] < a and loud_edge(a):
+                ext_start = max(ext_full[0], a - EXT_MIN_RAMP_SEC)
+            if ext_end < b + EXT_MIN_RAMP_SEC and ext_full[1] > b and loud_edge(b):
+                ext_end = min(ext_full[1], b + EXT_MIN_RAMP_SEC)
         # con am (nguong thap hon, 1 khung du): tu dau vung toi luc bat dau noi / tu luc het noi toi cuoi vung
         # (khong ap nen + 10 dB: file nen cao -> moi khung deu tinh la con am -> loi = ca vung nghe duoc, khong rut gi)
         fa, fs, fe, fb = frame(a), frame(speech_start), frame(speech_end), frame(b)
