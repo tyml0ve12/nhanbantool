@@ -17,7 +17,7 @@ import json
 import os
 import shutil
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 
 from core.capcut_project import ProjectError, DRAFT_FILE, US
@@ -40,6 +40,15 @@ class LanguageTrack:
     audio_duration_us: int
     placements: list     # [(target_start_us, source_start_us, duration_us, mute_head_us, mute_tail_us)]
     audible: bool
+    # Cau THUA khong du cho tren track chinh -> track phu "<ten> – câu thừa", TAT TIENG (chot 2026-10-20)
+    extra_placements: list = field(default_factory=list)
+
+
+EXTRA_TRACK_SUFFIX = " – câu thừa"
+
+
+def extra_track_name(language: str) -> str:
+    return language + EXTRA_TRACK_SUFFIX
 
 
 # Keyframe am luong CapCut (KFTypeVolume): cung dinh dang Tool edit nhac da ghi va chay that
@@ -122,7 +131,8 @@ def build_dubbed_draft(draft: dict, track_index: int, languages: list) -> dict:
     d = copy.deepcopy(draft)
     materials = d["materials"]
     orig_track = d["tracks"][track_index]
-    _remove_previous_dub_tracks(d, orig_track, {lang.name for lang in languages})
+    _remove_previous_dub_tracks(d, orig_track, {lang.name for lang in languages}
+                                | {extra_track_name(lang.name) for lang in languages})
     template_seg = sorted(orig_track["segments"], key=lambda s: s["target_timerange"]["start"])[0]
     index = _index_materials(materials)
     if template_seg.get("material_id") not in index:
@@ -147,38 +157,48 @@ def build_dubbed_draft(draft: dict, track_index: int, languages: list) -> dict:
         material["wave_points"] = []
         materials.setdefault("audios", []).append(material)
 
-        track_pos = len(d["tracks"])
-        new_track = {k: copy.deepcopy(v) for k, v in orig_track.items() if k != "segments"}
-        new_track["id"] = _new_id()
-        new_track["name"] = lang.name
-        new_track["is_default_name"] = False
-        new_track["segments"] = []
-
-        for placement in lang.placements:
-            target_us, source_us, dur_us = placement[:3]
-            mute_head, mute_tail = (placement[3], placement[4]) if len(placement) >= 5 else (0, 0)
-            seg = copy.deepcopy(template_seg)
-            seg["id"] = _new_id()
-            seg["material_id"] = material["id"]
-            seg["source_timerange"] = {"start": int(source_us), "duration": int(dur_us)}
-            seg["target_timerange"] = {"start": int(target_us), "duration": int(dur_us)}
-            seg["volume"] = 1.0
-            seg["last_nonzero_volume"] = 1.0
-            seg["speed"] = 1.0
-            if "track_render_index" in seg:
-                seg["track_render_index"] = track_pos
-            # Khong mang theo keyframe / "Ro dan-Mo dan" (audio_fades) cua doan goc lam mau: chung se
-            # chong len keyframe tat tieng cua tool (Tool edit nhac da gap: CapCut ap dung ca hai).
-            seg["common_keyframes"] = mute_keyframes(int(dur_us), int(mute_head), int(mute_tail), int(source_us))
-            if "keyframe_refs" in seg:
-                seg["keyframe_refs"] = []
-            seg["extra_material_refs"] = _clone_refs(template_seg.get("extra_material_refs", []),
-                                                     index, materials, skip_kinds={"audio_fades"})
-            new_track["segments"].append(seg)
+        new_track = _new_dub_track(d, orig_track, template_seg, index, materials, material, lang.name, lang.placements)
         # Chi 1 ngon ngu bat tieng; cac ngon ngu khac tat bang nut tat tieng track
         set_track_muted(new_track, not lang.audible)
         d["tracks"].append(new_track)
+        if lang.extra_placements:
+            extra = _new_dub_track(d, orig_track, template_seg, index, materials, material,
+                                   extra_track_name(lang.name), lang.extra_placements)
+            set_track_muted(extra, True)        # track phu cau thua luon tat tieng
+            d["tracks"].append(extra)
     return d
+
+
+def _new_dub_track(d, orig_track, template_seg, index, materials, material, name, placements) -> dict:
+    """1 track long tieng (chua gan vao draft): cac doan cat tu material theo placements."""
+    track_pos = len(d["tracks"])
+    new_track = {k: copy.deepcopy(v) for k, v in orig_track.items() if k != "segments"}
+    new_track["id"] = _new_id()
+    new_track["name"] = name
+    new_track["is_default_name"] = False
+    new_track["segments"] = []
+    for placement in placements:
+        target_us, source_us, dur_us = placement[:3]
+        mute_head, mute_tail = (placement[3], placement[4]) if len(placement) >= 5 else (0, 0)
+        seg = copy.deepcopy(template_seg)
+        seg["id"] = _new_id()
+        seg["material_id"] = material["id"]
+        seg["source_timerange"] = {"start": int(source_us), "duration": int(dur_us)}
+        seg["target_timerange"] = {"start": int(target_us), "duration": int(dur_us)}
+        seg["volume"] = 1.0
+        seg["last_nonzero_volume"] = 1.0
+        seg["speed"] = 1.0
+        if "track_render_index" in seg:
+            seg["track_render_index"] = track_pos
+        # Khong mang theo keyframe / "Ro dan-Mo dan" (audio_fades) cua doan goc lam mau: chung se
+        # chong len keyframe tat tieng cua tool (Tool edit nhac da gap: CapCut ap dung ca hai).
+        seg["common_keyframes"] = mute_keyframes(int(dur_us), int(mute_head), int(mute_tail), int(source_us))
+        if "keyframe_refs" in seg:
+            seg["keyframe_refs"] = []
+        seg["extra_material_refs"] = _clone_refs(template_seg.get("extra_material_refs", []),
+                                                 index, materials, skip_kinds={"audio_fades"})
+        new_track["segments"].append(seg)
+    return new_track
 
 
 # Bit 0 cua track["attribute"] = nut "tat tieng" (icon loa) tren dau track trong
@@ -254,14 +274,24 @@ def validate_dubbed(d: dict, orig_track_id: str, languages: list):
                if t.get("name") in {lang.name for lang in languages} and not is_track_muted(t)]
     if len(audible) > 1:
         raise ProjectError(f"Kiểm tra thất bại: nhiều track lồng tiếng cùng bật tiếng ({', '.join(audible)}).")
-    new_tracks = d["tracks"][-len(languages):] if languages else []
-    for lang, track in zip(languages, new_tracks):
-        segs = sorted(track["segments"], key=lambda s: s["target_timerange"]["start"])
-        if len(segs) != len(lang.placements):
-            raise ProjectError(f"Kiểm tra thất bại: track {lang.name} sai số segment.")
-        for a, b in zip(segs, segs[1:]):
-            if a["target_timerange"]["start"] + a["target_timerange"]["duration"] > b["target_timerange"]["start"]:
-                raise ProjectError(f"Kiểm tra thất bại: track {lang.name} có 2 câu chồng nhau.")
+    for lang in languages:
+        checks = [(lang.name, lang.placements)]
+        if lang.extra_placements:
+            checks.append((extra_track_name(lang.name), lang.extra_placements))
+        elif any(t.get("name") == extra_track_name(lang.name) for t in d["tracks"]):
+            raise ProjectError(f"Kiểm tra thất bại: còn track cũ {extra_track_name(lang.name)}.")
+        for name, placements in checks:
+            tracks = [t for t in d["tracks"] if t.get("name") == name]
+            if len(tracks) != 1:
+                raise ProjectError(f"Kiểm tra thất bại: có {len(tracks)} track tên {name}.")
+            if name != lang.name and not is_track_muted(tracks[0]):
+                raise ProjectError(f"Kiểm tra thất bại: track {name} chưa tắt tiếng.")
+            segs = sorted(tracks[0]["segments"], key=lambda s: s["target_timerange"]["start"])
+            if len(segs) != len(placements):
+                raise ProjectError(f"Kiểm tra thất bại: track {name} sai số segment.")
+            for a, b in zip(segs, segs[1:]):
+                if a["target_timerange"]["start"] + a["target_timerange"]["duration"] > b["target_timerange"]["start"]:
+                    raise ProjectError(f"Kiểm tra thất bại: track {name} có 2 câu chồng nhau.")
 
 
 def write_dubbed(draft_files: list, dubbed: dict) -> list:

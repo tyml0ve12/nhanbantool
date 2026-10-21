@@ -1,6 +1,7 @@
 """Cac buoc xu ly thuan (khong phu thuoc giao dien) - dung chung cho app va CLI."""
 import json
 import os
+import re
 from dataclasses import dataclass
 
 import numpy as np
@@ -87,6 +88,90 @@ def original_texts(clips: list, source_map: dict, words_by_file: dict) -> list:
         b = a + c.source_duration_us / US
         texts.append("".join(w.text for w in words if a - 0.1 <= (w.start + w.end) / 2 <= b + 0.1).strip())
     return texts
+
+
+# Giong moi THUA cau (chot 2026-10-20): cau goc da bi XOA khoi timeline nhung van nam trong file giong goc (vd bai 44
+# file 44.1 doan 21.5-27.9s "En Kenia, incluso…") -> giong moi van doc. Nhan ra nho doan co tieng trong file giong
+# goc nam giua 2 clip lien nhau (theo vi tri trong file) ma khong thuoc clip nao.
+EXTRA_MIN_GAP_SEC = 0.3       # doan ho ngan hon -> bo qua (cho cat giua 2 clip)
+EXTRA_MIN_SPEECH_SEC = 1.0    # tong khung co tieng (nang luong) trong doan ho
+EXTRA_MIN_WORDS = 3           # so chu whisper co trung diem trong doan ho
+EXTRA_REREAD_SIM = 0.7        # giong noi dung 1 clip bat ky -> "doc lai / loi voice", khong phai cau thua
+EXTRA_SENTENCE_END = re.compile(r"[.!?。！？…]+[\"'”’»)\]]*$")
+
+
+@dataclass
+class ExtraSpeech:
+    """Doan co tieng trong file giong goc khong thuoc clip nao."""
+    path: str
+    start: float              # giay trong file
+    end: float
+    speech: float             # tong thoi gian co tieng (giay)
+    text: str                 # chu whisper trong doan
+    after: int                # chi so clip (timeline) ngay TRUOC doan trong file; -1 = dau file
+    before: int               # chi so clip ngay SAU; -1 = cuoi file
+    kind: str                 # "thua" | "doc lai" | "manh" | "dau file" | "cuoi file"
+    reread_sim: float = 0.0   # do giong lon nhat voi noi dung 1 clip (doc lai)
+
+
+def find_extra_speech(clips: list, source_map: dict, words_by_file: dict, levels_by_file: dict,
+                      clip_texts: list, embed=None, frame_sec: float = 0.01) -> list:
+    """Tim doan co tieng trong file giong goc khong thuoc clip nao (moi file: truoc clip dau, giua 2 clip lien nhau
+    theo vi tri trong file, sau clip cuoi). Phan loai:
+      thua      - giua 2 clip, >= EXTRA_MIN_SPEECH_SEC co tieng, >= EXTRA_MIN_WORDS chu, ket bang dau ket cau,
+                  khong giong noi dung clip nao (cau goc da xoa khoi timeline -> giong moi co the doc thua);
+      doc lai   - giong >= EXTRA_REREAD_SIM noi dung 1 clip (ke ca clip file khac: file loi voice / bo sung) -> bo qua;
+      manh      - co tieng nhung ngan / it chu / khong ket cau (cat lem) -> chi canh bao;
+      dau file / cuoi file - truoc clip dau / sau clip cuoi cua file -> chi canh bao.
+    embed(texts) -> vector (MiniLM); None -> khong kiem "doc lai"."""
+    out = []
+    by_file = {}
+    for i, c in enumerate(clips):
+        path = source_map.get(c.source_path, "")
+        if path in words_by_file and path in levels_by_file:
+            by_file.setdefault(path, []).append(i)
+    clip_vec = None
+    for path, idx in by_file.items():
+        levels = levels_by_file[path]
+        if not len(levels):
+            continue
+        floor = level_floor(levels)
+        # nguong co tieng theo dinh CA FILE (doan ho co the chi co lang -> dinh doan ho khong dung lam moc)
+        threshold = max(floor + SPEECH_ABOVE_FLOOR_DB, float(np.percentile(levels, 95)) - SPEECH_BELOW_PEAK_DB)
+        idx = sorted(idx, key=lambda i: clips[i].source_start_us)
+        edges = [(-1, 0.0)] + [(i, (clips[i].source_start_us + clips[i].source_duration_us) / US) for i in idx]
+        starts = [(i, clips[i].source_start_us / US) for i in idx] + [(-1, len(levels) * frame_sec)]
+        covered_to = 0.0
+        for (after, gap_start), (before, gap_end) in zip(edges, starts):
+            gap_start = max(gap_start, covered_to)
+            if after >= 0:
+                covered_to = max(covered_to, (clips[after].source_start_us + clips[after].source_duration_us) / US)
+            if gap_end - gap_start < EXTRA_MIN_GAP_SEC:
+                continue
+            fa, fb = int(round(gap_start / frame_sec)), min(len(levels) - 1, int(round(gap_end / frame_sec)))
+            speech = float((levels[fa:fb + 1] > threshold).sum()) * frame_sec
+            ws = [w for w in words_by_file[path] if w.text.strip() and gap_start <= (w.start + w.end) / 2 < gap_end]
+            text = "".join(w.text for w in ws).strip()
+            if speech < 0.3:      # chi chu whisper (moc chu som / lech) ma khong co tieng -> khong phai doan noi
+                continue
+            item = ExtraSpeech(path, gap_start, gap_end, speech, text, after, before, "")
+            if after < 0:
+                item.kind = "dau file"
+            elif before < 0:
+                item.kind = "cuoi file"
+            elif speech < EXTRA_MIN_SPEECH_SEC or len(ws) < EXTRA_MIN_WORDS or not EXTRA_SENTENCE_END.search(text):
+                item.kind = "manh"
+            else:
+                item.kind = "thua"
+                if embed is not None and text:
+                    if clip_vec is None:
+                        clip_vec = embed([t or "" for t in clip_texts])
+                    v = embed([text])[0]
+                    item.reread_sim = float(max(clip_vec @ v)) if len(clip_vec) else 0.0
+                    if item.reread_sim >= EXTRA_REREAD_SIM:
+                        item.kind = "doc lai"
+            out.append(item)
+    return out
 
 
 def _text_of(material: dict) -> str:
@@ -460,6 +545,7 @@ def compute_placements(sentences: list, clips: list, timeline_end_us: int,
         placements.append((starts[i] - before, src_start[i] - before, lengths[i] + before + after, head[i], tail[i]))
         if debug is not None:
             debug.append(dict(clip=idx[i], onset_us=onset[i], speech_us=starts[i] + lead[i],
+                              core_us=(starts[i], starts[i] + lengths[i]), lead_us=lead[i],
                               th1_us=after_th1[i] - origin[i], th2_us=after_th2[i] - after_th1[i],
                               trim_start_us=trimmed0 if i == 0 else 0,
                               aud_head_cut_us=aud_head_want[i] - aud_head[i], aud_tail_cut_us=aud_tail_want[i] - aud_tail[i],

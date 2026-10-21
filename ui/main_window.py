@@ -1,4 +1,5 @@
 """Cua so chinh: Project goc -> Danh sach ngon ngu -> Chay -> Log."""
+import html
 import logging
 import os
 import subprocess
@@ -813,7 +814,16 @@ class MainWindow(QMainWindow):
 
     def _log(self, text):
         log.info(text)
-        self.log_view.appendPlainText(text)
+        # To mau (noi dung giu nguyen): LOI / voice THIEU cau -> do; cau THUA / canh bao -> cam
+        if "LỖI" in text or "THIẾU câu" in text:
+            color = "#ff6b6b"
+        elif "Cảnh báo" in text or "câu THỪA" in text or "không thuộc clip nào" in text:
+            color = "#e0b04a"
+        else:
+            color = ""
+        body = html.escape(text).replace(chr(10), "<br>")
+        style = "white-space: pre-wrap;" + (f" color: {color};" if color else "")
+        self.log_view.appendHtml(f'<span style="{style}">{body}</span>')
 
     def _restore_last_paths(self):
         last = self.settings.value("project_dir", "")

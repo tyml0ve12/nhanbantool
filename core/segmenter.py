@@ -49,6 +49,25 @@ REFINE_MIN_GAIN = 0.5         # chi doi ranh gioi khi tot hon ro rang
 REFINE_CLAUSE_RANGE = 2.0     # cau lech do dai: cho doi ranh gioi toi cho ngung sau dau phay / dau cau trong +-2s
 REFINE_PAUSE_SLACK = 0.35     # moc chu whisper lech -> tim khoang lang quanh 2 chu o ranh gioi trong +-0.35s
 
+# Giong moi THIEU cau (khong co ban dich 1 cau goc - vd bai 44 Bo thieu goc 41, 70). Chot 2026-10-21:
+# chi bo qua cau k khi y cua no khong co o dau quanh vi tri du kien: do giong lon nhat cua RIENG cau k voi moi doan
+# giong moi trong cua so cau k-2..k+2 (theo loi giai DP lan 1, doan dai toi "k + cau ben canh" de tinh ca ban dich
+# gop 2 cau) < SKIP_MAX_SIM VA thap hon ro cau ben canh VA cau goc ket cau (manh cat giua cau -> khong). Sau do DP
+# tu quyet (bo qua phai tot hon ca doan, phat SKIP_PENALTY). Do tren 26 giong/bai (COO duyet 2026-10-21): MiniLM
+# khong tach duoc thieu that / co mat bang 1 nguong (thieu that 0.34-0.47, co mat thap toi 0.22) -> loc rong 0.5 roi
+# de DP quyet: bat 44 Bo 41 + 70, 107 Han 54, 0 bao nham (bo sot 107 Nhat 89 -> giu cach cu).
+# Khoang SKIP_MAX_SIM..SKIP_UNSURE_SIM: giu cach cu + canh bao "co the thieu" (hien = 0, khong dung).
+SKIP_MAX_SIM = 0.5
+SKIP_UNSURE_SIM = 0.5
+SKIP_NEIGHBOR_GAP = 0.2       # thap hon cau ben canh (thap nhat) it nhat muc nay
+SKIP_PENALTY = 0.5
+SKIP_SPAN_FACTOR = 1.3        # doan so toi da dai 1.3 x ti le toc do x (cau k + cau ben canh dai hon)
+MAX_MISSING = 5               # thieu > 5 cau -> bao loi ngon ngu do, khong xep (nguoi dung chot 2026-10-21)
+# Cau MA (ghosts): cau goc da xoa khoi timeline nhung con trong file giong goc (pipeline.find_extra_speech) - giong
+# moi co the doc thua. Tuy chon: duoc bo qua (buoc 0, khong tinh la thieu), khong gop 2:1 voi cau ben canh, chi nhan
+# doan giong moi khi do giong >= GHOST_MIN_SIM (chan ca thieu + thua triet nhau).
+GHOST_MIN_SIM = 0.5
+
 MIN_CORRELATION = 0.60    # do khop do dai duoi muc nay -> bao loi
 WARN_CORRELATION = 0.80
 LOW_SIMILARITY = 0.35     # cau co do giong nghia duoi muc nay -> canh bao
@@ -87,6 +106,7 @@ class SegmentResult:
     used_meaning: bool
     warnings: list = field(default_factory=list)
     merged: list = field(default_factory=list)   # [(nhan cau dau, nhan cau bi gop)]
+    missing: list = field(default_factory=list)  # nhan cac cau goc giong moi THIEU (bo qua, de trong)
     debug: dict = field(default_factory=dict)    # chi de ghi log chan doan (so cho ngat...)
 
 
@@ -145,11 +165,13 @@ def _candidates(words, silences, t0, t1, min_pause=MIN_PAUSE):
 
 def split_sentences(words, original_durations, silences, audio_duration,
                     original_texts=None, embedder=None, on_log=None, labels=None,
-                    pair_gaps=None, min_pause=MIN_PAUSE) -> SegmentResult:
+                    pair_gaps=None, min_pause=MIN_PAUSE, ghosts=None) -> SegmentResult:
     """labels: so thu tu hien thi cua tung cau trong canh bao (vd so thu tu tren
     timeline khi cau duoc can theo thu tu doc). Mac dinh 1..N.
     pair_gaps[k]: khoang cach tren timeline (giay) giua cau goc k va k+1 (thu tu doc)
-    - dung de phat viec gop 2 cau cach xa nhau."""
+    - dung de phat viec gop 2 cau cach xa nhau.
+    ghosts: chi so (thu tu doc) cac cau MA - xem GHOST_MIN_SIM. sentences[g] = None neu giong moi khong doc."""
+    ghosts = frozenset(ghosts or ())
     n = len(original_durations)
     labels = labels or list(range(1, n + 1))
     merge_cost = [MERGE_PENALTY + MERGE_GAP_WEIGHT * min(MERGE_FAR_GAP, max(0.0, g))
@@ -183,6 +205,8 @@ def split_sentences(words, original_durations, silences, audio_duration,
     spans = [(a, b) for a in range(last_node) for b in range(a + 1, min(last_node, a + MAX_UNITS) + 1)
              if node_end[b] - node_start[a] <= max_len]
     sim = sim2 = None
+    skip, unsure, local = {g: SKIP_PENALTY for g in ghosts}, [], []   # duoc bo qua {k: phi}; nghi thieu [(nhan, giong)]
+    candidates = []                     # ung vien thieu [(k, giong cuc bo, giong thap nhat cau ben canh)] - ghi log
     use_meaning = bool(original_texts) and embedder is not None and len(original_texts) == n
     if use_meaning:
         mids = np.array([(w.start + w.end) / 2 for w in words])
@@ -208,13 +232,39 @@ def split_sentences(words, original_durations, silences, audio_duration,
         coarse, coarse2 = vec @ orig_vec.T, (vec @ pair_vec.T if pair_vec is not None else None)
         sim = {span: coarse[k] for k, span in enumerate(spans)}
         sim2 = {span: coarse2[k] for k, span in enumerate(spans)} if coarse2 is not None else None
-        steps = _align_iter(n, node_start, node_end, node_score, original_durations, ratio, sim, sim2, orig_total, merge_cost)
+        steps = _align_iter(n, node_start, node_end, node_score, original_durations, ratio, sim, sim2, orig_total,
+                            merge_cost, skip, ghosts)
+        if steps is not None:
+            local = _local_best(n, steps, sim, node_start, node_end, original_durations, ratio)
+            real = [k for k in range(n) if k not in ghosts]
+            found = False
+            for j, k in enumerate(real):
+                near = [local[real[x]] for x in (j - 1, j + 1) if 0 <= x < len(real)]
+                near_min = min(near) if near else 1.0
+                # cau goc la MANH (clip cat giua cau, khong ket cau - vd 232 Duc 20 "Mientras tanto, la"): ban dich
+                # thuong dinh vao cau ben canh -> khong coi la thieu
+                if not SENTENCE_END_RE.search(texts[k].strip()):
+                    continue
+                if local[k] < SKIP_UNSURE_SIM and local[k] <= near_min - SKIP_NEIGHBOR_GAP:
+                    if local[k] < SKIP_MAX_SIM:
+                        skip[k] = SKIP_PENALTY
+                        candidates.append((k, local[k], near_min))
+                        found = True
+                    else:
+                        unsure.append((labels[k], local[k]))
+            if found:
+                with_skip = _align_iter(n, node_start, node_end, node_score, original_durations, ratio, sim, sim2,
+                                        orig_total, merge_cost, skip, ghosts)
+                if with_skip is not None:
+                    steps = with_skip
 
         # Buoc 2 (chinh xac): chay model tren nguyen doan cho cac cach cat lan
         # can phuong an buoc 1 (moi ranh gioi xe dich +-1 cho ngat), chon lai.
         if steps is not None:
             near = []
-            for a0, b0, _, _ in steps:
+            for a0, b0, _, st0 in steps:
+                if st0 == 0:
+                    continue
                 for a in range(a0 - REFINE_RADIUS, a0 + REFINE_RADIUS + 1):
                     for b in range(b0 - REFINE_RADIUS, b0 + REFINE_RADIUS + 1):
                         if 0 <= a < b <= last_node and (a == 0) == (a0 == 0) and (b == last_node) == (b0 == last_node):
@@ -228,23 +278,29 @@ def split_sentences(words, original_durations, silences, audio_duration,
             fine = {span: exact[k] for k, span in enumerate(near)}
             fine2 = {span: exact2[k] for k, span in enumerate(near)} if exact2 is not None else None
             refined = _align_iter(n, node_start, node_end, node_score, original_durations, ratio,
-                                  fine, fine2, orig_total, merge_cost)
+                                  fine, fine2, orig_total, merge_cost, skip, ghosts)
             if refined is not None:
                 steps, sim, sim2 = refined, fine, fine2
     else:
-        steps = _align_iter(n, node_start, node_end, node_score, original_durations, ratio, None, None, orig_total, merge_cost)
+        steps = _align_iter(n, node_start, node_end, node_score, original_durations, ratio, None, None, orig_total,
+                            merge_cost, skip, ghosts)
     if steps is None:
         raise SegmentError("Không căn được câu mới với câu gốc (độ dài quá chênh lệch). "
                            "Kiểm tra audio có đúng kịch bản của project này không.")
-    ratio = sum(node_end[b] - node_start[a] for a, b, _, _ in steps) / orig_total
+    ratio = _step_ratio(steps, node_start, node_end, original_durations)
 
     # sentences[k] = cau moi cua cau goc k; cau goc duoc GOP vao cau truoc -> None
     sentences = [None] * n
     expected = [0.0] * n            # do dai goc tuong ung (cong ca cau bi gop)
     sent_words = [None] * n         # cac tu whisper cua tung cau moi (de tinh chinh ranh gioi)
     merged = []
+    missing = []                    # cau goc giong moi thieu (DP bo qua): de trong
     joined = []                     # cap doc lien khong ngung da tach tai ranh gioi tu: [(nhan, nhan, chu o cho tach)]
     for a, b, k, step in steps:
+        if step == 0:
+            if k not in ghosts:        # cau ma giong moi khong doc: binh thuong, khong phai thieu
+                missing.append(k)
+            continue
         s, e = node_start[a], node_end[b]
         span_words = [w for w in words if s - 0.3 <= (w.start + w.end) / 2 <= e + 0.1]
         if step == 2:
@@ -273,6 +329,10 @@ def split_sentences(words, original_durations, silences, audio_duration,
         expected[k] = sum(original_durations[k:k + step])
         if step == 2:
             merged.append((labels[k], labels[k + 1]))
+    if len(missing) > MAX_MISSING:
+        raise SegmentError(f"Giọng mới THIẾU {len(missing)} câu (quá {MAX_MISSING} câu): "
+                           + "; ".join(f"câu {labels[k]} '{texts[k][:50]}'" for k in missing[:12])
+                           + (" …" if len(missing) > 12 else "") + ". Kiểm tra lại file voice (thiếu đoạn / thiếu phần?).")
     present = [k for k in range(n) if sentences[k] is not None]
     refine_log = []
     if use_meaning:
@@ -293,12 +353,13 @@ def split_sentences(words, original_durations, silences, audio_duration,
             sentences[y].debug["start_kind"] = sentences[y].debug.get("start_kind", "") + KIND_OVERLAP
 
     if use_meaning:
-        low = sorted(labels[k] for k in present if sentences[k].similarity < LOW_SIMILARITY)
+        low = sorted(labels[k] for k in present if k not in ghosts and sentences[k].similarity < LOW_SIMILARITY)
         if len(low) > MAX_LOW_SIMILARITY_SHARE * n:
             raise SegmentError(
                 f"{len(low)}/{n} câu có nội dung không khớp câu gốc (vd câu {', '.join(map(str, low[:5]))}). "
                 "Audio này có thể thiếu/thừa câu hoặc không cùng kịch bản.")
-    corr = _correlation([sentences[k].end - sentences[k].start for k in present], [expected[k] for k in present])
+    real_present = [k for k in present if k not in ghosts]
+    corr = _correlation([sentences[k].end - sentences[k].start for k in real_present], [expected[k] for k in real_present])
     if corr < MIN_CORRELATION:
         raise SegmentError(f"Độ khớp độ dài câu mới với câu gốc quá thấp ({corr:.2f}). "
                            "Audio này có thể không cùng kịch bản, hoặc thiếu/thừa câu.")
@@ -309,7 +370,7 @@ def split_sentences(words, original_durations, silences, audio_duration,
                         "Nên mở CapCut nghe kiểm tra.")
     if corr < WARN_CORRELATION:
         warnings.append(f"Độ khớp độ dài câu chỉ {corr:.2f} — nên mở CapCut nghe kiểm tra.")
-    for k in present:
+    for k in real_present:
         sent, od = sentences[k], expected[k]
         if use_meaning and sent.similarity < LOW_SIMILARITY:
             warnings.append(f"Câu {labels[k]}: nội dung ít giống câu gốc ({sent.similarity:.2f}) — nên nghe kiểm tra.")
@@ -318,25 +379,59 @@ def split_sentences(words, original_durations, silences, audio_duration,
                             f"({od:.1f}s) — nên nghe kiểm tra.")
     debug = dict(pauses=len(cands), silence_pauses=sum(1 for x in node_kind[1:-1] if x == KIND_SILENCE),
                  speech_start=t0, speech_end=t1,
-                 refine=[dict(m, labels=(labels[m["x"]], labels[m["y"]])) for m in refine_log])
-    return SegmentResult(sentences, corr, ratio, use_meaning, warnings, merged, debug)
+                 refine=[dict(m, labels=(labels[m["x"]], labels[m["y"]])) for m in refine_log],
+                 missing_sim=[(labels[k], local[k]) for k in missing] if missing else [], unsure_missing=unsure,
+                 missing_candidates=[(labels[k], v, near, "bo qua (thieu)" if k in missing else "giu (DP khong bo)")
+                                     for k, v, near in candidates])
+    return SegmentResult(sentences, corr, ratio, use_meaning, warnings, merged, debug=debug,
+                         missing=[labels[k] for k in missing])
 
 
-def _align_iter(n, node_start, node_end, node_score, original_durations, ratio, sim, sim2, orig_total, merge_cost):
-    """Chay DP 2 lan: lan 2 dung ti le toc do tinh lai tu ket qua lan 1."""
+def _align_iter(n, node_start, node_end, node_score, original_durations, ratio, sim, sim2, orig_total, merge_cost,
+                skip=None, ghosts=frozenset()):
+    """Chay DP 2 lan: lan 2 dung ti le toc do tinh lai tu ket qua lan 1 (khong tinh cau bi bo qua)."""
     steps = None
     for _ in range(2):
-        steps = _align(n, node_start, node_end, node_score, original_durations, ratio, sim, sim2, merge_cost)
+        steps = _align(n, node_start, node_end, node_score, original_durations, ratio, sim, sim2, merge_cost, skip, ghosts)
         if steps is None:
             return None
-        ratio = sum(node_end[b] - node_start[a] for a, b, _, _ in steps) / orig_total
+        ratio = _step_ratio(steps, node_start, node_end, original_durations)
     return steps
 
 
-def _align(n, node_start, node_end, node_score, original_durations, ratio, sim, sim2, merge_cost):
+def _step_ratio(steps, node_start, node_end, original_durations) -> float:
+    """Ti le toc do = tong do dai doan moi / tong do dai cau goc duoc xep (bo cau thieu - buoc 0)."""
+    total = sum(sum(original_durations[k:k + st]) for _, _, k, st in steps if st)
+    return sum(node_end[b] - node_start[a] for a, b, _, st in steps if st) / max(1e-9, total)
+
+
+def _local_best(n, steps, sim, node_start, node_end, original_durations, ratio) -> list:
+    """Do giong lon nhat cua RIENG cau goc k voi moi doan giong moi quanh vi tri du kien (cau k-2..k+2 theo loi giai
+    DP, doan dai toi SKIP_SPAN_FACTOR x ti le x (k + cau ben canh dai hon) - de tinh ca ban dich gop 2 cau)."""
+    where = {}
+    for a, b, k, st in steps:
+        for j in range(k, k + max(1, st)):
+            where[j] = (node_start[a], node_end[b])
+    out = []
+    for k in range(n):
+        lo, hi = where[max(0, k - 2)][0], where[min(n - 1, k + 2)][1]
+        nb = max([original_durations[j] for j in (k - 1, k + 1) if 0 <= j < n] or [0.0])
+        limit = SKIP_SPAN_FACTOR * ratio * (original_durations[k] + nb)
+        best = 0.0
+        for (a, b), v in sim.items():
+            if node_start[a] >= lo - 0.01 and node_end[b] <= hi + 0.01 and node_end[b] - node_start[a] <= limit:
+                best = max(best, float(v[k]))
+        out.append(best)
+    return out
+
+
+def _align(n, node_start, node_end, node_score, original_durations, ratio, sim, sim2, merge_cost, skip=None,
+           ghosts=frozenset()):
     """Quy hoach dong. Moi buoc = 1 doan audio moi (node a -> node b) phu:
       - 1 cau goc (binh thuong), hoac
-      - 2 cau goc LIEN NHAU (can 2:1, chi khi co so nghia): ban dich doc lien 2 cau.
+      - 2 cau goc LIEN NHAU (can 2:1, chi khi co so nghia): ban dich doc lien 2 cau, hoac
+      - 0 audio (buoc 0, a = b): bo qua cau goc k giong moi thieu - chi cac cau trong skip {k: phi}.
+    Cau ma (ghosts): khong gop 2:1, chi nhan doan co do giong >= GHOST_MIN_SIM.
     Tra ve [(a, b, cau_goc_dau, so_cau_goc)] hoac None."""
     last_node = len(node_start) - 1
     INF = float("inf")
@@ -351,6 +446,8 @@ def _align(n, node_start, node_end, node_score, original_durations, ratio, sim, 
             if not prev:
                 continue
             k = i - step
+            if step == 2 and (k in ghosts or k + 1 in ghosts):
+                continue
             expected = ratio * sum(original_durations[k:i])
             table = sim if step == 1 else sim2
             for b in targets:
@@ -366,6 +463,10 @@ def _align(n, node_start, node_end, node_score, original_durations, ratio, sim, 
                         v = table.get((a, b))
                         if v is None:
                             continue
+                        if k in ghosts and float(v[k]) < GHOST_MIN_SIM:
+                            continue
+                    elif k in ghosts:
+                        continue
                     dev = math.log(length / expected) / LOG_RATIO_SIGMA
                     cost = pa[0] + 0.5 * dev * dev - node_score[b]
                     if table is not None:
@@ -378,6 +479,13 @@ def _align(n, node_start, node_end, node_score, original_durations, ratio, sim, 
                     if cost < best:
                         best = cost
                         cur[b] = (cost, a, step)
+        if skip and (i - 1) in skip:      # bo qua cau goc i-1: giu nguyen node, them phi
+            for b, pa in costs[i - 1].items():
+                if i == n and b != last_node:
+                    continue
+                cost = pa[0] + skip[i - 1]
+                if cost < cur.get(b, (float("inf"),))[0]:
+                    cur[b] = (cost, b, 0)
         if not cur:
             return None
         costs.append(cur)
@@ -386,8 +494,8 @@ def _align(n, node_start, node_end, node_score, original_durations, ratio, sim, 
     steps, i, b = [], n, last_node
     while i > 0:
         _, a, step = costs[i][b]
-        steps.append((a, b, i - step, step))
-        i, b = i - step, a
+        steps.append((a, b, i - max(1, step), step))
+        i, b = i - max(1, step), a
     return list(reversed(steps))
 
 
