@@ -1,13 +1,15 @@
 """1 ngon ngu co the gom NHIEU PHAN audio (vd 1.mp3 ... 10.mp3, ten file khong
 co ten ngon ngu - nguoi dung tu dat ten ngon ngu khi them). Module nay: sap theo
 so, bao so thu tu bi hong, ghep cac phan thanh 1 file."""
+import hashlib
 import json
 import os
 import re
+import tempfile
 
 from core import audio
 from core.capcut_project import AUDIO_EXTS
-from core.paths import find_ffmpeg
+from core.paths import MAX_PATH, find_ffmpeg, long_path_message, path_too_long
 
 NUMBER_RE = re.compile(r"(\d+)(?!.*\d)")    # so CUOI CUNG trong ten file
 
@@ -53,9 +55,24 @@ def numbering_problem(paths: list) -> str:
     return f"thiếu phần {', '.join(map(str, missing))}" if missing else ""
 
 
+MERGED_SUFFIX = " (gộp).mp3"
+TEMP_SUFFIX = ".part.mp3"     # hau to dai nhat cua file canh file gop (.json ngan hon)
+
+
 def merged_path(parts: list, language: str) -> str:
+    """File gop = thu muc phan 1 + "<ten ngon ngu> (gộp).mp3". Ten ngon ngu dai (vd = ten thu muc dai) lam duong
+    dan vuot gioi han Windows -> giu phan cuoi ten + 6 ky tu ma bam (van khac nhau giua cac ngon ngu cung thu muc).
+    Ten ngan GIU NGUYEN duong dan cu (cache nhan dang giong noi khoa theo duong dan)."""
     safe = "".join("_" if ch in '<>:"/\\|?*' else ch for ch in language).strip() or "audio"
-    return os.path.join(os.path.dirname(parts[0]), f"{safe} (gộp).mp3")
+    folder = os.path.dirname(parts[0])
+    out = os.path.join(folder, f"{safe}{MERGED_SUFFIX}")
+    if not path_too_long(out, len(TEMP_SUFFIX)):
+        return out
+    tag = "~" + hashlib.sha1(safe.encode("utf-8")).hexdigest()[:6]
+    room = MAX_PATH - 1 - len(os.path.abspath(folder)) - 1 - len(tag + MERGED_SUFFIX + TEMP_SUFFIX)
+    if room < 8:
+        raise audio.AudioError(long_path_message(out))
+    return os.path.join(folder, f"{safe[-room:].lstrip()}{tag}{MERGED_SUFFIX}")     # giu phan CUOI (thuong la ten ngon ngu)
 
 
 def merge_parts(parts: list, language: str) -> tuple:
@@ -73,7 +90,9 @@ def merge_parts(parts: list, language: str) -> tuple:
         except (OSError, ValueError):
             pass
 
-    list_file = out + ".txt"
+    # Danh sach cho ffmpeg concat ghi vao thu muc tam (duong dan ngan), khong ghi canh cac phan
+    fd, list_file = tempfile.mkstemp(suffix=".txt")
+    os.close(fd)
     with open(list_file, "w", encoding="utf-8") as f:
         for p in parts:
             f.write("file '" + os.path.abspath(p).replace("'", "'\\''") + "'\n")

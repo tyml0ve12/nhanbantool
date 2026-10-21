@@ -303,6 +303,11 @@ class ExportDialog(QDialog):
         if len({p.lower() for p in paths}) != len(paths):
             QMessageBox.warning(self, "Xuất video", "Có 2 video trùng tên file — hãy sửa lại tên.")
             return
+        from core.paths import long_path_message, path_too_long
+        too_long = [p for p in paths if path_too_long(p, len(".part.mp4"))]     # file tam khi render
+        if too_long:
+            QMessageBox.warning(self, "Xuất video", long_path_message(too_long[0]))
+            return
         # Du cho trong cho TAT CA video chua (bao truoc, khong de render 10 phut roi moi loi)
         import shutil
         from core.render import estimate_size_bytes, needs_encode

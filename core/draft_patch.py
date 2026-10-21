@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from core.capcut_project import ProjectError, DRAFT_FILE, US
+from core.paths import long_path_message, path_too_long
 
 DUBBED_FILE = "draft_content.dubbed.json"
 BACKUP_PREFIX = "draft_content.backup_"
@@ -270,6 +271,8 @@ def write_dubbed(draft_files: list, dubbed: dict) -> list:
     for path in draft_files:
         out = os.path.join(os.path.dirname(path), DUBBED_FILE)
         tmp = out + ".tmp"
+        if path_too_long(tmp):
+            raise ProjectError(long_path_message(tmp))
         with open(tmp, "w", encoding="utf-8") as f:
             f.write(text)
         os.replace(tmp, out)
@@ -287,6 +290,9 @@ def apply_to_project(draft_files: list) -> str:
         if not os.path.isfile(dubbed):
             raise ProjectError(f"Chưa có file kết quả {DUBBED_FILE} cạnh {path}. Hãy chạy lại.")
         pairs.append((path, dubbed))
+    for path, _ in pairs:
+        if path_too_long(os.path.join(os.path.dirname(path), f"{BACKUP_PREFIX}{stamp}.json")):
+            raise ProjectError(long_path_message(os.path.join(os.path.dirname(path), f"{BACKUP_PREFIX}{stamp}.json")))
     for path, _ in pairs:
         shutil.copy2(path, os.path.join(os.path.dirname(path), f"{BACKUP_PREFIX}{stamp}.json"))
     for path, dubbed in pairs:

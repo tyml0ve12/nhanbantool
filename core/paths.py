@@ -2,6 +2,20 @@
 import os
 import shutil
 
+# Windows (chua bat "long paths"): duong dan file toi da 259 ky tu - dai hon thi mo/ghi file loi
+# "[Errno 2] No such file or directory" (bai 44: ten ngon ngu = ten thu muc dai, file gop 268 ky tu).
+MAX_PATH = 260
+
+
+def path_too_long(path: str, extra: int = 0) -> bool:
+    """True neu duong dan (+ extra ky tu hau to cua file tam, vd ".part.mp4") vuot gioi han Windows."""
+    return os.name == "nt" and len(os.path.abspath(path)) + extra >= MAX_PATH
+
+
+def long_path_message(path: str) -> str:
+    return (f"Đường dẫn quá dài ({len(os.path.abspath(path))} ký tự, Windows giới hạn {MAX_PATH - 1}):\n{path}\n"
+            "Hãy đổi tên thư mục / tên ngôn ngữ / tên file ngắn hơn, hoặc chuyển project tới thư mục ngắn hơn.")
+
 
 def get_app_dir() -> str:
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

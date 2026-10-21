@@ -13,6 +13,7 @@ from PySide6.QtCore import QThread, Signal
 
 from core import audio, draft_patch, logo, parts, pipeline, render, segmenter, speech
 from core.capcut_project import ProjectError, US, is_capcut_running
+from core.paths import long_path_message, path_too_long
 
 log = logging.getLogger("run_worker")
 
@@ -473,6 +474,8 @@ class RunWorker(QThread):
         out_path = (cfg.output_paths or {}).get(job.row) or \
             os.path.join(cfg.output_dir, output_name(cfg.video_path, job.name))
         settings = cfg.render_settings or render.RECOMMENDED
+        if path_too_long(out_path, len(".part.mp4")):      # file tam khi render: <ten>.mp4.part.mp4
+            raise audio.AudioError(long_path_message(out_path))
         self.language_status.emit(job.row, "Đang dựng audio…", "run")
         fd, wav = tempfile.mkstemp(suffix=".wav")
         os.close(fd)
