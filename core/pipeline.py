@@ -77,7 +77,8 @@ def short_insert_clips(clips: list) -> set:
     first = clips[reading_order(clips)[0]].source_path
     out = set()
     for path, idx in by_file.items():
-        if path != first and len(idx) <= SHORT_INSERT_MAX_CLIPS and                 any(o[0] < idx[0] and idx[-1] < o[-1] for p, o in by_file.items() if p != path):
+        if path != first and len(idx) <= SHORT_INSERT_MAX_CLIPS and \
+                any(o[0] < idx[0] and idx[-1] < o[-1] for p, o in by_file.items() if p != path):
             out.update(idx)
     return out
 
@@ -398,6 +399,10 @@ SOUND_PAD_SEC = 0.05
 # ve mau song cau ben canh o 2 dau clip (viec #7, 2026-10-21). Nguong = thap hon cua "con am" cau ben canh (dinh vung
 # cau do - 35 dB) va nen + 10 dB: chi dung "con am" con sot tieng tho/duoi am +11..18 dB tren nen (41: 76/124 clip).
 EXT_GUARD_SEC = 0.025
+OVERLAP_VALLEY_SEC = 0.3     # 2 diem cat cu chong nhau: tim cho lang nhat trong +-0.3s quanh trung diem (T-001)
+# ... nhung khong ra ngoai vung chong [dau cau sau, cuoi cau truoc] qua 0.1s: cap doc lien, ngoai do la chu dau / cuoi
+# cau ben canh (do 21/10: +-0.3s tron lam cho cat truot 0.2-0.48s sang chu dau cau sau o 232 Duc 28|29, 232 Anh 26|27)
+OVERLAP_OUTSIDE_SEC = 0.1
 # ... nhung mep nghe duoc nam giua tieng TO (> nen + 20 dB, vd cap doc lien tach theo moc chu) van giu phan keo dai
 # >= 10ms: con doan vuot keyframe 0 -> 100% (draft_patch.MUTE_RAMP_US), CapCut khong phat/ngat dot ngot (QA 15-1)
 EXT_MIN_RAMP_SEC = 0.010
@@ -471,16 +476,48 @@ def voice_spans(sentences: list, levels, frame_sec: float, audio_duration: float
         mid = (len(seg) - 1) / 2
         return (a + min(quiet, key=lambda i: abs(i - mid))) * frame_sec
 
+    def loud_near(t):
+        return float(levels[max(0, frame(t) - 2):frame(t) + 3].max())
+
+    def wide_valley(t0, t1):
+        """Nhu valley nhung xet muc TO NHAT trong +-2 khung (+-20ms) quanh moi khung: giong doc lien chi co khe lang
+        hep, 1 khung lang giua 2 am tiet khong phai cho ngung (T-001)."""
+        a, b = frame(t0), frame(t1)
+        if b <= a:
+            return t0
+        seg = np.array([levels[max(0, i - 2):i + 3].max() for i in range(a, b + 1)])
+        quiet = [i for i in range(len(seg)) if seg[i] <= seg.min() + 3]
+        mid = (len(seg) - 1) / 2
+        return (a + min(quiet, key=lambda i: abs(i - mid))) * frame_sec
+
     cuts, cut_how = [], []   # cho cat giua cau k va k+1: cho lang nhat trong khoang trong giua 2 diem cat cu
+    exact = []               # cho cat dung CHINH XAC cho 2 cau (khong noi theo diem cat cu) - T-001
     for k in range(len(present) - 1):
         lo, hi = present[k].end, present[k + 1].start
-        cuts.append(valley(lo, hi) if hi > lo else (lo + hi) / 2)
-        cut_how.append(f"valley({hi - lo:.2f}s)" if hi > lo else "giua(hi<=lo)")
+        if hi > lo:
+            cuts.append(valley(lo, hi))
+            cut_how.append(f"valley({hi - lo:.2f}s)")
+            exact.append(False)
+            continue
+        # 2 diem cat cu chong nhau (giong doc lien, ranh gioi theo moc chu): trung diem hay roi sat luc phat am (T-001,
+        # 35/35 cho C1 o 44 / 232 Bo) -> cho lang nhat trong +-OVERLAP_VALLEY_SEC quanh do, khong qua dau cau truoc /
+        # cuoi cau sau; chi doi khi that su lang hon trung diem
+        mid = (lo + hi) / 2
+        cut = mid
+        if len(levels):
+            v = wide_valley(max(present[k].start, mid - OVERLAP_VALLEY_SEC, hi - OVERLAP_OUTSIDE_SEC),
+                            min(present[k + 1].end, mid + OVERLAP_VALLEY_SEC, lo + OVERLAP_OUTSIDE_SEC))
+            if loud_near(v) < loud_near(mid):
+                cut = v
+        cuts.append(cut)
+        exact.append(cut != mid)    # 2 cau chia nhau dung cho lang (khong ai giu phan chong cu nam giua tieng)
+        cut_how.append(f"valley_chong({loud_near(mid) - loud_near(cut):.1f}dB)" if cut != mid else "giua(hi<=lo)")
     bounds, sounds = [], []          # vung [a, b] tung cau + nguong con am cua vung (dung cho phan keo dai cau ben canh)
     for k, s in enumerate(present):
         a = cuts[k - 1] if k > 0 else max(0.0, s.start - EXTEND_SEC)
         b = cuts[k] if k + 1 < len(present) else min(audio_duration, s.end + EXTEND_SEC)
-        a, b = min(a, s.start), max(b, s.end)
+        a = a if k > 0 and exact[k - 1] else min(a, s.start)
+        b = b if k + 1 < len(present) and exact[k] else max(b, s.end)
         bounds.append((a, b))
         sounds.append(float(np.percentile(levels[frame(a):frame(b) + 1], 95)) - SOUND_BELOW_PEAK_DB
                       if len(levels) else 0.0)
