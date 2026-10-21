@@ -23,6 +23,8 @@ MODE_BOTH = "both"
 
 MIN_SUBTITLE_COVER = 0.8   # phu de phu it hon muc nay -> nhan dang giong goc thay the
 EXTRA_ROOM_SEC = 0.3       # cau thua GIU (doc lai) dat track chinh khi khoang trong >= loi cau + 0.3s
+EDGE_LOUD_DB = 20           # mep nghe duoc to hon nen muc nay = nam giua tieng noi -> vuot dai (T-001)
+EDGE_RAMP_US = 25_000       # vuot 25ms (CapCut + mp4) thay vi 10ms o mep giua tieng to
 TAIL_EARLY_SEC = 30        # doan cuoi voice dat truoc clip cuoi hon 30s -> canh bao do "Duoi voice" (viec #6b)
 
 
@@ -416,12 +418,16 @@ class RunWorker(QThread):
         # Cat o cho lang nhat giua 2 cau (giu tron chu dau/cuoi), keo dai 0.5s moi dau (phan lan sang
         # cau ben canh tat tieng), luc bat dau noi = luc giong goc bat dau noi (ca 2 do bang nang luong).
         span_dbg, place_dbg = {}, []
-        spans = pipeline.voice_spans(result.sentences, audio.levels_db(job.audio_path), audio.LEVEL_FRAME_SEC, dur,
-                                     span_dbg)
+        levels = audio.levels_db(job.audio_path)
+        spans = pipeline.voice_spans(result.sentences, levels, audio.LEVEL_FRAME_SEC, dur, span_dbg)
         onsets = getattr(self, "_onsets", None)
         placements, report = pipeline.compute_placements(by_clip, clips, timeline_end, spans, onsets, place_dbg)
         placements, place_dbg, job.extra_placements, extra_notes = self._place_extras(
             job, ghosts, clips, by_clip, spans, onsets, timeline_end, placements, place_dbg)
+        job.edge_ramps = self._edge_ramps(placements, levels)
+        loud = sum((h > draft_patch.MUTE_RAMP_US) + (t > draft_patch.MUTE_RAMP_US) for h, t in job.edge_ramps)
+        log.info("[%s] Mep nghe duoc giua tieng to (> nen + %d dB): %d/%d mep -> vuot %dms", job.name, EDGE_LOUD_DB,
+                 loud, 2 * len(placements), EDGE_RAMP_US // 1000)
         self.log.emit(f"[{job.name}] Mỗi câu kéo dài {pipeline.EXTEND_SEC:g}s hai đầu (phần lấn câu bên cạnh tắt tiếng); "
                       "lúc bắt đầu nói căn theo " + ("giọng gốc (đo theo âm lượng)." if onsets
                                                      else "mép câu gốc (không có file giọng gốc)."))
@@ -598,7 +604,8 @@ class RunWorker(QThread):
         os.close(fd)
         try:
             audio.build_dub_wav(job.audio_path, [tuple(v / US for v in p) for p in placements],
-                                video_duration, wav)
+                                video_duration, wav,
+                                [(h / US, t / US) for h, t in getattr(job, "edge_ramps", None) or []] or None)
 
             def on_progress(p, speed, eta):
                 self.language_status.emit(job.row, f"Đang render {p}%", "run")
@@ -630,6 +637,25 @@ class RunWorker(QThread):
             nxt = self._order[k + 1] if k + 1 < len(self._order) else None
             plan += [("g", e) for e in extras if e.after == i and e.before == nxt]
         return plan
+
+    @staticmethod
+    def _edge_ramps(placements, levels) -> list:
+        """Vuot am luong tung doan [(dau_us, cuoi_us)]: mep nghe duoc nam giua tieng TO (muc to nhat +-20ms > nen +
+        EDGE_LOUD_DB - giong doc lien, khong co cho lang de cat) -> EDGE_RAMP_US thay vi MUTE_RAMP_US (T-001). Cho cat
+        / luc noi khong doi."""
+        if not len(levels):
+            return []
+        floor = pipeline.level_floor(levels)
+
+        def loud(t_us):
+            f = int(round(t_us / US / audio.LEVEL_FRAME_SEC))
+            return float(levels[max(0, f - 2):max(1, f + 3)].max()) > floor + EDGE_LOUD_DB
+
+        out = []
+        for target, source, dur, head, tail in (p[:5] for p in placements):
+            out.append((EDGE_RAMP_US if loud(source + head) else draft_patch.MUTE_RAMP_US,
+                        EDGE_RAMP_US if loud(source + dur - tail) else draft_patch.MUTE_RAMP_US))
+        return out
 
     @staticmethod
     def _early_tail(placements, clips) -> str:
@@ -791,7 +817,8 @@ class RunWorker(QThread):
         names = [job.name for job, _, _ in results]
         audible = cfg.default_language if cfg.default_language in names else names[0]
         tracks = [draft_patch.LanguageTrack(job.name, job.audio_path, dur_us, placements, job.name == audible,
-                                            list(getattr(job, "extra_placements", None) or []))
+                                            list(getattr(job, "extra_placements", None) or []),
+                                            list(getattr(job, "edge_ramps", None) or []))
                   for job, placements, dur_us in results]
         dubbed = draft_patch.build_dubbed_draft(draft, cfg.track_index, tracks)
         draft_patch.validate_dubbed(dubbed, draft["tracks"][cfg.track_index]["id"], tracks)

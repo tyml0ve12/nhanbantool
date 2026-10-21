@@ -68,10 +68,11 @@ def decode_to_pcm(path: str, out_path: str):
         raise AudioError(f"Không giải mã được audio {os.path.basename(path)}:\n{result.stderr[-400:]}")
 
 
-def build_dub_wav(source_audio: str, placements: list, total_duration: float, out_wav: str):
+def build_dub_wav(source_audio: str, placements: list, total_duration: float, out_wav: str, ramps: list = None):
     """placements: [(vi_tri_tren_timeline, cat_tu, thoi_luong[, tat_dau, tat_cuoi])] (giay), da sap
     xep, khong chong nhau. tat_dau/tat_cuoi: phan keo dai o 2 dau doan -> am luong 0 (giong keyframe
-    trong draft). Ghi ra file WAV dai dung total_duration: cho nao co cau thi co tieng, con lai im lang."""
+    trong draft). ramps: [(vuot_dau, vuot_cuoi)] (giay) song song placements - giong LanguageTrack.ramps.
+    Ghi ra file WAV dai dung total_duration: cho nao co cau thi co tieng, con lai im lang."""
     import wave
 
     fd, pcm_path = tempfile.mkstemp(suffix=".pcm")
@@ -85,7 +86,7 @@ def build_dub_wav(source_audio: str, placements: list, total_duration: float, ou
             out.setsampwidth(2)
             out.setframerate(SAMPLE_RATE)
             written = 0
-            for placement in placements:
+            for k, placement in enumerate(placements):
                 target, cut_from, length = placement[:3]
                 mute_head, mute_tail = (placement[3], placement[4]) if len(placement) >= 5 else (0.0, 0.0)
                 t0 = int(round(target * SAMPLE_RATE))
@@ -106,7 +107,8 @@ def build_dub_wav(source_audio: str, placements: list, total_duration: float, ou
                 n = min(want, total_frames - t0, max(0, src_frames - s0))
                 src.seek(s0 * BYTES_PER_FRAME)
                 data = src.read(n * BYTES_PER_FRAME)
-                data = _mute_edges(data, head, max(0, tail - (want - n)))
+                ramp_head, ramp_tail = (r * 1000 for r in ramps[k]) if ramps else (None, None)
+                data = _mute_edges(data, head, max(0, tail - (want - n)), ramp_head_ms=ramp_head, ramp_tail_ms=ramp_tail)
                 out.writeframes(_fade(data))
                 written = t0 + len(data) // BYTES_PER_FRAME
             _write_silence(out, total_frames - written)
@@ -125,26 +127,33 @@ def _write_silence(out, frames):
         frames -= n
 
 
-def _mute_edges(data: bytes, head_frames: int, tail_frames: int, ramp_ms: int = 10) -> bytes:
+def _mute_edges(data: bytes, head_frames: int, tail_frames: int, ramp_ms: int = 10,
+                ramp_head_ms: float = None, ramp_tail_ms: float = None) -> bytes:
     """Tat tieng (0) phan keo dai dau/cuoi doan - giong keyframe am luong ghi vao draft CapCut
-    (0 -> vuot 10ms -> 100% ... 100% -> vuot 10ms -> 0)."""
-    if head_frames <= 0 and tail_frames <= 0:
+    (0 -> vuot 10ms -> 100% ... 100% -> vuot 10ms -> 0). ramp_head_ms / ramp_tail_ms > ramp_ms: mep nghe duoc giua
+    tieng to -> vuot dai hon, ke ca khi khong co phan keo dai (giong mute_keyframes, T-001)."""
+    ramp_head_ms = ramp_ms if ramp_head_ms is None else ramp_head_ms
+    ramp_tail_ms = ramp_ms if ramp_tail_ms is None else ramp_tail_ms
+    long_head, long_tail = ramp_head_ms > ramp_ms, ramp_tail_ms > ramp_ms
+    if head_frames <= 0 and tail_frames <= 0 and not long_head and not long_tail:
         return data
     import numpy as np
     x = np.frombuffer(data, dtype=np.int16).reshape(-1, CHANNELS).astype(np.float32)
     n = len(x)
     env = np.ones(n, dtype=np.float32)
     # vung nghe duoc ngan hon 2 lan vuot -> vuot ngan lai (giong mute_keyframes trong draft)
-    ramp = min(int(SAMPLE_RATE * ramp_ms / 1000), max(0, (n - max(0, head_frames) - max(0, tail_frames)) // 2))
-    if head_frames > 0:
-        h = min(n, head_frames)
+    half = max(0, (n - max(0, head_frames) - max(0, tail_frames)) // 2)
+    ramp_head = min(int(SAMPLE_RATE * ramp_head_ms / 1000), half)
+    ramp_tail = min(int(SAMPLE_RATE * ramp_tail_ms / 1000), half)
+    if head_frames > 0 or long_head:
+        h = min(n, max(0, head_frames))
         env[:h] = 0
-        r = env[h:h + ramp]
-        env[h:h + ramp] = np.linspace(0, 1, len(r), endpoint=False)
-    if tail_frames > 0:
-        t = max(0, n - tail_frames)
+        r = env[h:h + ramp_head]
+        env[h:h + ramp_head] = np.linspace(0, 1, len(r), endpoint=False)
+    if tail_frames > 0 or long_tail:
+        t = max(0, n - max(0, tail_frames))
         env[t:] = 0
-        lo = max(0, t - ramp)
+        lo = max(0, t - ramp_tail)
         env[lo:t] = np.minimum(env[lo:t], np.linspace(1, 0, t - lo, endpoint=False))
     return (x * env[:, None]).round().astype(np.int16).tobytes()
 
