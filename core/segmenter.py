@@ -655,7 +655,11 @@ def _refine_clause(x, y, sentences, sent_words, texts, expected, ratio, embedder
     xw, yw = sent_words[x], sent_words[y]
     len_x, len_y = sentences[x].end - sentences[x].start, sentences[y].end - sentences[y].start
     out_x, out_y = _is_outlier(len_x, expected[x], ratio), _is_outlier(len_y, expected[y], ratio)
-    if not (out_x or out_y):
+    # (c') T-002: ranh gioi kieu K1 - chu cuoi truoc cho cat KHONG co dau cau (cat giua cum tu, vd 107 Viet 79|80
+    # "lap | tuc") -> cung thu, du 2 cau khong lech do dai
+    last = xw[-1].text.strip()
+    k1 = not (SENTENCE_END_RE.search(last) or CLAUSE_END_RE.search(last))
+    if not (out_x or out_y or k1):
         return False
     old_cut = (sentences[x].end + sentences[y].start) / 2
     old_pause = _pause_between(silences, sentences[x].end - PAD_AFTER, sentences[y].start + PAD_BEFORE)[2]
