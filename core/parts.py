@@ -59,27 +59,45 @@ MERGED_SUFFIX = " (gộp).mp3"
 TEMP_SUFFIX = ".part.mp3"     # hau to dai nhat cua file canh file gop (.json ngan hon)
 
 
-def merged_path(parts: list, language: str) -> str:
-    """File gop = thu muc phan 1 + "<ten ngon ngu> (gộp).mp3". Ten ngon ngu dai (vd = ten thu muc dai) lam duong
-    dan vuot gioi han Windows -> giu phan cuoi ten + 6 ky tu ma bam (van khac nhau giua cac ngon ngu cung thu muc).
-    Ten ngan GIU NGUYEN duong dan cu (cache nhan dang giong noi khoa theo duong dan)."""
-    safe = "".join("_" if ch in '<>:"/\\|?*' else ch for ch in language).strip() or "audio"
-    folder = os.path.dirname(parts[0])
+FALLBACK_SUBDIR = "voice nhan ban"     # thu muc trong project CapCut khi thu muc cac phan qua sau (T-018)
+
+
+def _fit_in(folder: str, safe: str):
+    """Duong dan file gop trong `folder` vua gioi han Windows, hoac None neu thu muc qua sau."""
     out = os.path.join(folder, f"{safe}{MERGED_SUFFIX}")
     if not path_too_long(out, len(TEMP_SUFFIX)):
         return out
     tag = "~" + hashlib.sha1(safe.encode("utf-8")).hexdigest()[:6]
     room = MAX_PATH - 1 - len(os.path.abspath(folder)) - 1 - len(tag + MERGED_SUFFIX + TEMP_SUFFIX)
     if room < 8:
-        raise audio.AudioError(long_path_message(out))
+        return None
     return os.path.join(folder, f"{safe[-room:].lstrip()}{tag}{MERGED_SUFFIX}")     # giu phan CUOI (thuong la ten ngon ngu)
 
 
-def merge_parts(parts: list, language: str) -> tuple:
+def merged_path(parts: list, language: str, fallback_dir: str = "") -> str:
+    """File gop = thu muc phan 1 + "<ten ngon ngu> (gộp).mp3". Ten ngon ngu dai (vd = ten thu muc dai) lam duong
+    dan vuot gioi han Windows -> giu phan cuoi ten + 6 ky tu ma bam (van khac nhau giua cac ngon ngu cung thu muc).
+    Ten ngan GIU NGUYEN duong dan cu (cache nhan dang giong noi khoa theo duong dan).
+    Thu muc cac phan qua sau (vd Google Drive nhieu cap, bai 311) -> ghi vao `fallback_dir`\\voice nhan ban
+    (thu muc project CapCut)."""
+    safe = "".join("_" if ch in '<>:"/\\|?*' else ch for ch in language).strip() or "audio"
+    folder = os.path.dirname(parts[0])
+    out = _fit_in(folder, safe)
+    if out:
+        return out
+    if fallback_dir:
+        alt = _fit_in(os.path.join(fallback_dir, FALLBACK_SUBDIR), safe)
+        if alt:
+            return alt
+    raise audio.AudioError(long_path_message(os.path.join(folder, f"{safe}{MERGED_SUFFIX}")))
+
+
+def merge_parts(parts: list, language: str, fallback_dir: str = "") -> tuple:
     """Ghep cac phan (dung thu tu) thanh 1 file mp3 canh cac phan - CapCut can
     1 file lam material. Dung lai file gop cu neu cac phan khong doi (giu duoc
     cache nhan dang giong noi). Tra ve (duong_dan, da_dung_lai)."""
-    out = merged_path(parts, language)
+    out = merged_path(parts, language, fallback_dir)
+    os.makedirs(os.path.dirname(out), exist_ok=True)
     sidecar = out + ".json"
     signature = [[os.path.abspath(p), os.path.getsize(p), int(os.path.getmtime(p))] for p in parts]
     if os.path.isfile(out) and os.path.isfile(sidecar):
