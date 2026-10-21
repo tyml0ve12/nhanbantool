@@ -328,7 +328,8 @@ class RunWorker(QThread):
             self.log.emit(f"[{job.name}] {'Dùng lại' if reused else 'Đã ghép'} {len(job.parts)} phần → "
                           f"{os.path.basename(job.audio_path)}")
             if os.path.dirname(os.path.abspath(job.audio_path)) != os.path.dirname(os.path.abspath(job.parts[0])):
-                self.log.emit(f"[{job.name}] Thư mục các phần quá sâu → file ghép đặt trong project: {job.audio_path}")
+                self.log.emit(f"[{job.name}] Các phần nằm trên Google Drive / thư mục quá sâu → file ghép đặt trong "
+                              f"project: {job.audio_path}")
         else:
             job.audio_path = job.parts[0]
         self.language_status.emit(job.row, "Nhận dạng giọng nói…", "run")

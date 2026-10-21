@@ -60,6 +60,14 @@ TEMP_SUFFIX = ".part.mp3"     # hau to dai nhat cua file canh file gop (.json ng
 
 
 FALLBACK_SUBDIR = "voice nhan ban"     # thu muc trong project CapCut khi thu muc cac phan qua sau (T-018)
+# Thu muc dong bo Google Drive: KHONG ghi file gop canh cac phan (cham, bi day len mang, duong dan sau)
+CLOUD_MARKERS = (r"\.shortcut-targets-by-id", r"\my drive", r"\drive của tôi", r"\shared drives",
+                 r"\bộ nhớ dùng chung", r"\other computers", r"\máy tính khác", r"\google drive")
+
+
+def on_cloud_drive(path: str) -> bool:
+    p = os.path.abspath(path).lower() + "\\"
+    return any(m + "\\" in p for m in CLOUD_MARKERS)
 
 
 def _fit_in(folder: str, safe: str):
@@ -78,11 +86,11 @@ def merged_path(parts: list, language: str, fallback_dir: str = "") -> str:
     """File gop = thu muc phan 1 + "<ten ngon ngu> (gộp).mp3". Ten ngon ngu dai (vd = ten thu muc dai) lam duong
     dan vuot gioi han Windows -> giu phan cuoi ten + 6 ky tu ma bam (van khac nhau giua cac ngon ngu cung thu muc).
     Ten ngan GIU NGUYEN duong dan cu (cache nhan dang giong noi khoa theo duong dan).
-    Thu muc cac phan qua sau (vd Google Drive nhieu cap, bai 311) -> ghi vao `fallback_dir`\\voice nhan ban
-    (thu muc project CapCut)."""
+    Thu muc cac phan qua sau (vd Google Drive nhieu cap, bai 311) HOAC nam tren Google Drive -> ghi vao
+    `fallback_dir`\\voice nhan ban (thu muc project CapCut, o may)."""
     safe = "".join("_" if ch in '<>:"/\\|?*' else ch for ch in language).strip() or "audio"
     folder = os.path.dirname(parts[0])
-    out = _fit_in(folder, safe)
+    out = None if (fallback_dir and on_cloud_drive(folder)) else _fit_in(folder, safe)
     if out:
         return out
     if fallback_dir:
