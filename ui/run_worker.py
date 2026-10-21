@@ -23,7 +23,7 @@ MODE_BOTH = "both"
 
 MIN_SUBTITLE_COVER = 0.8   # phu de phu it hon muc nay -> nhan dang giong goc thay the
 EXTRA_ROOM_SEC = 0.3       # cau thua GIU (doc lai) dat track chinh khi khoang trong >= loi cau + 0.3s
-EDGE_LOUD_DB = 20           # mep nghe duoc to hon nen muc nay = nam giua tieng noi -> vuot dai (T-001)
+EDGE_LOUD_DB = 15           # mep nghe duoc to hon nen muc nay = nam giua tieng noi -> vuot dai (T-001, COO chot 15)
 EDGE_RAMP_US = 25_000       # vuot 25ms (CapCut + mp4) thay vi 10ms o mep giua tieng to
 TAIL_EARLY_SEC = 30        # doan cuoi voice dat truoc clip cuoi hon 30s -> canh bao do "Duoi voice" (viec #6b)
 
