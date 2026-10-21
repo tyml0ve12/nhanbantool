@@ -124,76 +124,10 @@ EXTRA_MIN_WORDS = 3           # so chu whisper co trung diem trong doan ho
 EXTRA_REREAD_SIM = 0.7        # giong noi dung 1 clip bat ky -> "doc lai / loi voice", khong phai cau thua
 EXTRA_REREAD_WARN = 0.55      # cau thua giong 1 clip tu muc nay (duoi EXTRA_REREAD_SIM) -> canh bao "co the doc lai"
 EXTRA_SENTENCE_END = re.compile(r"[.!?。！？…]+[\"'”’»)\]]*$")
-# Doan thua DAI (T-017, chot 2026-10-21): tong phan noi ca doan ho > 15s -> giong moi doc doan nay bi XOA (track phu tat
-# tieng), tru loi keu goi hanh dong / doan giong 1 cau da co. Doan ho nhieu cau -> chia thanh nhieu cau ma theo dau ket
-# cau (1 cau ma phai nam trong MAX_UNITS cho ngat cua DP tach cau).
-EXTRA_DELETE_SPEECH_SEC = 15.0
-# ... tru cau ma giong 1 clip tu muc nay (doc lai). Do 2026-10-21 (44 bo clip 61-64 / 56-60): cau CUNG CANH nhung khac
-# noi dung giong clip ben canh 0.38-0.64 -> 0.55 chan gan het; doc lai that >= EXTRA_REREAD_SIM (da loai tu truoc).
-EXTRA_DELETE_REREAD_SIM = 0.70
-
-# Loi keu goi hanh dong (dang ky kenh, bat thong bao, binh luan "ban xem tu dau", like, chia se): so nghia voi cau mau
-# da ngon ngu + tu khoa. Do 2026-10-21 tren 3126 cau that (goc + giong moi 7 bai, 13 giong): loi keu goi co tu khoa
-# giong mau 0.45-0.83, cau thuong co tu khoa ("like a dancer", "inscrit") <= 0.29; cau ngan vo nghia ("Lô.") toi 0.68.
-CTA_SAMPLES = [
-    'đừng quên đăng ký kênh và bấm chuông thông báo',
-    'hãy like và chia sẻ video này',
-    'cho chúng tôi biết bạn đang theo dõi từ đâu trong phần bình luận',
-    'để lại bình luận bên dưới cho chúng tôi biết',
-    'subscribe to the channel and turn on notifications',
-    "don't forget to like and share this video",
-    "tell us where you're watching from in the comments",
-    'leave a comment below and let us know',
-    'suscríbete al canal y activa las notificaciones',
-    'dale me gusta y comparte este video',
-    'cuéntanos en los comentarios desde dónde nos ves',
-    'inscreva-se no canal e ative as notificações',
-    'deixe seu like e compartilhe este vídeo',
-    'conte nos comentários de onde você está assistindo',
-    'abonniere den Kanal und aktiviere die Glocke',
-    'like und teile dieses Video',
-    'schreib uns in die Kommentare, von wo aus du zuschaust',
-    'abonnez-vous à la chaîne et activez les notifications',
-    'likez et partagez cette vidéo',
-    "dites-nous en commentaire d'où vous regardez",
-    'اشترك في القناة وفعّل الإشعارات',
-    'اترك تعليقاً وأخبرنا من أين تشاهد',
-    'チャンネル登録と通知をオンにしてください',
-    'どこから見ているかコメントで教えてください',
-    '구독과 알림 설정 부탁드립니다',
-    '어디에서 보고 계신지 댓글로 알려주세요',
-    '请订阅频道并打开通知',
-    '在评论中告诉我们你从哪里观看',
-    'подпишитесь на канал и включите уведомления',
-    'напишите в комментариях, откуда вы смотрите',
-    'iscriviti al canale e attiva le notifiche',
-    'scrivi nei commenti da dove ci guardi',
-]
-CTA_KEYWORDS = re.compile(
-    r"subscri|suscr|inscrev|inscri|abonn|iscriv|подпиш|订阅|訂閱|구독|チャンネル登録|اشترك|đăng ký|"
-    r"notifica|benachrichtig|glocke|campan|уведомл|通知|알림|الإشعار|thông báo|"
-    r"comment|coment|kommentar|bình luận|комментар|评论|評論|댓글|コメント|تعليق|"
-    r"\blike\b|me gusta|gefällt|j'aime|curtir|좋아요|高評価|点赞|"
-    r"\bshare\b|compart|partag|teile|condivid|поделит|分享|공유|シェア|شارك|chia sẻ", re.I)
-CTA_SIM_WITH_KEYWORD = 0.40   # co tu khoa: giong mau tu muc nay
-CTA_SIM_ALONE = 0.70          # khong tu khoa: phai rat giong mau + du dai
-CTA_MIN_WORDS = 4
-_cta_vectors = {}
-
-
-def call_to_action(text: str, embed) -> tuple:
-    """(la loi keu goi?, do giong mau lon nhat, co tu khoa?). embed(texts) -> vector da chuan hoa; None -> chi tu khoa
-    khong du (luon False)."""
-    text = " ".join(str(text or "").split())
-    keyword = bool(CTA_KEYWORDS.search(text))
-    if not text or embed is None:
-        return False, 0.0, keyword
-    key = id(getattr(embed, "__self__", embed))
-    if key not in _cta_vectors:
-        _cta_vectors[key] = embed(CTA_SAMPLES)
-    sim = float(max(_cta_vectors[key] @ embed([text])[0]))
-    words = len(text.split()) if re.search(r"[^\W\d_]{2,}\s", text) else len(text) // 2   # tieng khong cach chu
-    return (keyword and sim >= CTA_SIM_WITH_KEYWORD) or (sim >= CTA_SIM_ALONE and words >= CTA_MIN_WORDS), sim, keyword
+# Giong moi doc cau thua -> XOA het (T-017, nguoi dung chot 2026-10-21 "thua thi xoa het cho khop voice goc"): khong dat track
+# chinh, khong co trong mp4 -> track phu tat tieng + canh bao. Doan ho nhieu cau -> chia thanh nhieu cau ma theo dau ket
+# cau (1 cau ma phai nam trong MAX_UNITS cho ngat cua DP tach cau). Doan giong 1 clip >= EXTRA_REREAD_SIM la "doc lai",
+# khong thanh cau ma (khong xoa).
 
 
 @dataclass
@@ -209,9 +143,6 @@ class ExtraSpeech:
     kind: str                 # "thua" | "doc lai" | "manh" | "dau file" | "cuoi file"
     reread_sim: float = 0.0   # do giong lon nhat voi noi dung 1 clip (doc lai)
     group: int = -1           # doan ho chia nhieu cau: cung so = cung 1 doan ho lien nhau
-    group_speech: float = 0.0  # tong phan noi ca doan ho (quy tac xoa doan thua dai > EXTRA_DELETE_SPEECH_SEC)
-    cta: bool = False         # loi keu goi hanh dong (call_to_action tren chu giong goc)
-    cta_sim: float = 0.0
 
 
 def find_extra_speech(clips: list, source_map: dict, words_by_file: dict, levels_by_file: dict,
@@ -270,7 +201,7 @@ def find_extra_speech(clips: list, source_map: dict, words_by_file: dict, levels
                         fa, fb = int(round(a / frame_sec)), min(len(levels) - 1, int(round(b / frame_sec)))
                         piece = ExtraSpeech(path, a, b, float((levels[fa:fb + 1] > threshold).sum()) * frame_sec,
                                             "".join(w.text for w in pws).strip(), after, before, "")
-                    piece.kind, piece.group, piece.group_speech = "thua", group, speech
+                    piece.kind, piece.group = "thua", group
                     if embed is not None and piece.text:
                         if clip_vec is None:
                             clip_vec = embed([t or "" for t in clip_texts])
@@ -278,7 +209,6 @@ def find_extra_speech(clips: list, source_map: dict, words_by_file: dict, levels
                         piece.reread_sim = float(max(clip_vec @ v)) if len(clip_vec) else 0.0
                         if piece.reread_sim >= EXTRA_REREAD_SIM:
                             piece.kind = "doc lai"
-                        piece.cta, piece.cta_sim, _ = call_to_action(piece.text, embed)
                     out.append(piece)
                 continue
             out.append(item)
