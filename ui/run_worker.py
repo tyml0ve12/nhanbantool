@@ -353,7 +353,8 @@ class RunWorker(QThread):
         texts_in_order = [source_texts[x] if kind == "c" else x.text for kind, x in plan] if source_texts else None
         split_args = dict(labels=[x + 1 if kind == "c" else f"thừa sau {x.after + 1}" for kind, x in plan],
                           pair_gaps=self._plan_gaps(clips, plan),
-                          ghosts={k for k, (kind, x) in enumerate(plan) if kind == "g" or x in self._optional})
+                          ghosts={k for k, (kind, _) in enumerate(plan) if kind == "g"},
+                          optional={k for k, (kind, x) in enumerate(plan) if kind == "c" and x in self._optional})
         embedder = self._embed() if source_texts else None
         try:
             result = segmenter.split_sentences(words, durations_ext, silences, dur, texts_in_order, embedder,

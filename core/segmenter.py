@@ -67,6 +67,10 @@ MAX_MISSING = 5               # thieu > 5 cau -> bao loi ngon ngu do, khong xep 
 # moi co the doc thua. Tuy chon: duoc bo qua (buoc 0, khong tinh la thieu), khong gop 2:1 voi cau ben canh, chi nhan
 # doan giong moi khi do giong >= GHOST_MIN_SIM (chan ca thieu + thua triet nhau).
 GHOST_MIN_SIM = 0.5
+# Cau TUY CHON cua file phu chen ngan (loi keu goi, pipeline.short_insert_clips): nguong cao hon - loi keu goi KHAC
+# noi dung trong giong moi (vd "suscribete..." cuoi voice Tay 120) giong 0.45-0.49, ban dich dung 0.78-0.88, dien dat
+# ngan gon khac di 0.66 (do 2026-10-21, COO chot 0.58).
+OPTIONAL_MIN_SIM = 0.58
 
 MIN_CORRELATION = 0.60    # do khop do dai duoi muc nay -> bao loi
 WARN_CORRELATION = 0.80
@@ -165,13 +169,14 @@ def _candidates(words, silences, t0, t1, min_pause=MIN_PAUSE):
 
 def split_sentences(words, original_durations, silences, audio_duration,
                     original_texts=None, embedder=None, on_log=None, labels=None,
-                    pair_gaps=None, min_pause=MIN_PAUSE, ghosts=None) -> SegmentResult:
+                    pair_gaps=None, min_pause=MIN_PAUSE, ghosts=None, optional=None) -> SegmentResult:
     """labels: so thu tu hien thi cua tung cau trong canh bao (vd so thu tu tren
     timeline khi cau duoc can theo thu tu doc). Mac dinh 1..N.
     pair_gaps[k]: khoang cach tren timeline (giay) giua cau goc k va k+1 (thu tu doc)
     - dung de phat viec gop 2 cau cach xa nhau.
-    ghosts: chi so (thu tu doc) cac cau MA - xem GHOST_MIN_SIM. sentences[g] = None neu giong moi khong doc."""
-    ghosts = frozenset(ghosts or ())
+    ghosts: chi so (thu tu doc) cac cau MA - xem GHOST_MIN_SIM. sentences[g] = None neu giong moi khong doc.
+    optional: cau TUY CHON (file phu chen ngan) - nhu cau ma, nguong OPTIONAL_MIN_SIM."""
+    ghosts = {g: GHOST_MIN_SIM for g in ghosts or ()} | {o: OPTIONAL_MIN_SIM for o in optional or ()}   # {k: do giong toi thieu}
     n = len(original_durations)
     labels = labels or list(range(1, n + 1))
     merge_cost = [MERGE_PENALTY + MERGE_GAP_WEIGHT * min(MERGE_FAR_GAP, max(0.0, g))
@@ -431,7 +436,7 @@ def _align(n, node_start, node_end, node_score, original_durations, ratio, sim, 
       - 1 cau goc (binh thuong), hoac
       - 2 cau goc LIEN NHAU (can 2:1, chi khi co so nghia): ban dich doc lien 2 cau, hoac
       - 0 audio (buoc 0, a = b): bo qua cau goc k giong moi thieu - chi cac cau trong skip {k: phi}.
-    Cau ma (ghosts): khong gop 2:1, chi nhan doan co do giong >= GHOST_MIN_SIM.
+    Cau ma (ghosts {k: do giong toi thieu}): khong gop 2:1, chi nhan doan co do giong >= nguong cua cau do.
     Tra ve [(a, b, cau_goc_dau, so_cau_goc)] hoac None."""
     last_node = len(node_start) - 1
     INF = float("inf")
@@ -463,7 +468,7 @@ def _align(n, node_start, node_end, node_score, original_durations, ratio, sim, 
                         v = table.get((a, b))
                         if v is None:
                             continue
-                        if k in ghosts and float(v[k]) < GHOST_MIN_SIM:
+                        if k in ghosts and float(v[k]) < ghosts[k]:
                             continue
                     elif k in ghosts:
                         continue
