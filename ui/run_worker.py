@@ -22,6 +22,7 @@ MODE_EXPORT = "export"
 MODE_BOTH = "both"
 
 MIN_SUBTITLE_COVER = 0.8   # phu de phu it hon muc nay -> nhan dang giong goc thay the
+EXTRA_ROOM_SEC = 0.3       # cau thua GIU (doc lai) dat track chinh khi khoang trong >= loi cau + 0.3s
 TAIL_EARLY_SEC = 30        # doan cuoi voice dat truoc clip cuoi hon 30s -> canh bao do "Duoi voice" (viec #6b)
 
 
@@ -307,7 +308,7 @@ class RunWorker(QThread):
         edge = 0
         groups = {}
         for e in self._extras:
-            if e.group >= 0:
+            if e.kind == "thua" and e.group >= 0:
                 groups.setdefault(e.group, []).append(e)
         for e in self._extras:
             log.info("DOAN HO giong goc [%s] %s %.2f-%.2fs tieng %.2fs sau cau %d truoc cau %d giong clip %.2f: '%s'"
@@ -315,11 +316,15 @@ class RunWorker(QThread):
                      e.before + 1, e.reread_sim, e.text, e.group, len(groups.get(e.group, [])))
             where = f"{os.path.basename(e.path)} {e.start:.1f}–{e.end:.1f}s"
             group = groups.get(e.group, [])
-            if group and e is group[0]:         # doan ho (1 hay nhieu cau): bao 1 dong
+            if e.kind == "thua" and e is group[0]:      # doan ho (1 hay nhieu cau, co the vat qua 2 phan): bao 1 dong
+                last = group[-1]
+                span = (f"{os.path.basename(e.path)} {e.start:.1f}–{last.end:.1f}s" if last.path == e.path else
+                        f"{os.path.basename(e.path)} {e.start:.1f}s → {os.path.basename(last.path)} {last.end:.1f}s")
+                reread = [x for x in group if x.reread_sim >= pipeline.EXTRA_REREAD_SIM]
                 many = f", {len(group)} câu" if len(group) > 1 else ""
-                self.log.emit(f"Giọng gốc có đoạn không thuộc clip nào (câu gốc đã xóa khỏi timeline?): "
-                              f"{os.path.basename(e.path)} {e.start:.1f}–{group[-1].end:.1f}s{many} '{e.text[:80]}' → "
-                              "giọng mới đọc đoạn này sẽ bị bỏ khỏi track chính (track phụ tắt tiếng).")
+                self.log.emit(f"Giọng gốc có đoạn không thuộc clip nào (câu gốc đã xóa khỏi timeline?): {span}{many} "
+                              f"'{e.text[:80]}' → giọng mới đọc đoạn này sẽ bị bỏ khỏi track chính (track phụ tắt tiếng)"
+                              + (f", trừ {len(reread)} câu giống câu đã có (đọc lại → giữ)." if reread else "."))
             elif e.kind == "manh":
                 self.log.emit(f"Cảnh báo: giọng gốc {where} có đoạn ngắn không thuộc clip nào ('{e.text[:60]}') "
                               "— có thể clip bị cắt lẹm, nên kiểm tra.")
@@ -415,7 +420,8 @@ class RunWorker(QThread):
                                      span_dbg)
         onsets = getattr(self, "_onsets", None)
         placements, report = pipeline.compute_placements(by_clip, clips, timeline_end, spans, onsets, place_dbg)
-        job.extra_placements, extra_notes = self._place_extras(job, ghosts, clips, spans, timeline_end, place_dbg)
+        placements, place_dbg, job.extra_placements, extra_notes = self._place_extras(
+            job, ghosts, clips, by_clip, spans, onsets, timeline_end, placements, place_dbg)
         self.log.emit(f"[{job.name}] Mỗi câu kéo dài {pipeline.EXTEND_SEC:g}s hai đầu (phần lấn câu bên cạnh tắt tiếng); "
                       "lúc bắt đầu nói căn theo " + ("giọng gốc (đo theo âm lượng)." if onsets
                                                      else "mép câu gốc (không có file giọng gốc)."))
@@ -651,11 +657,15 @@ class RunWorker(QThread):
                 gaps.append(max(0.0, (clips[b].target_start_us - end_a) / US))
         return gaps
 
-    def _place_extras(self, job, ghosts, clips, spans, timeline_end, place_dbg):
+    def _place_extras(self, job, ghosts, clips, by_clip, spans, onsets, timeline_end, placements, place_dbg):
         """Cau THUA giong moi doc (cau ma da nhan doan) -> XOA khoi track chinh, khong co trong mp4 (T-017, chot
         2026-10-21): track phu "<ten> – câu thừa" TAT TIENG, ngay sau cau truoc (cau cua clip e.after) de nguoi dung
-        nghe kiem tra. Cac cau khac khong doi. Tra ve (placements track phu, canh bao: 1 dong / doan ho)."""
-        aux, dropped = [], {}                  # dropped: {nhom: [(ExtraSpeech, cau)]}
+        nghe kiem tra. Rieng cau ma giong 1 clip >= EXTRA_REREAD_SIM (doc lai, trong doan ho nhieu cau - T-017b): GIU
+        nhu v1.2.6 - du cho (tu het loi cau truoc toi luc noi cau sau >= loi cau + EXTRA_ROOM_SEC) -> track chinh, khong
+        du -> track phu. Cac cau khac khong doi. Tra ve (placements track chinh, place_dbg, track phu, canh bao)."""
+        aux, main, dropped, kept = [], [], {}, []    # main: [(ExtraSpeech, cau, luc noi)]; dropped: {khuc: [(e, cau)]}
+        run = {}                               # nhom -> so khuc (cau doc lai giu lai o giua -> canh bao tach 2 khuc)
+        base_speech = {d["clip"]: d["speech_us"] for d in place_dbg}
         for e, sent in ghosts:
             if sent is None:
                 log.info("[%s] Cau thua %s %.2f-%.2fs: giong moi khong doc -> bo qua", job.name,
@@ -671,24 +681,75 @@ class RunWorker(QThread):
                 end_ref = clips[e.after].target_start_us + clips[e.after].target_duration_us
                 prev_end = max((d["core_us"][1] for d in place_dbg if d["core_us"][0] <= end_ref), default=0)
             speech_tl = prev_end + lead
-            pl, _ = pipeline.compute_placements([sent], [pipeline.OriginalClip(speech_tl, core_len, "", 0, 0)],
-                                                max(timeline_end, speech_tl + core_len), spans, None, [])
-            aux += pl
-            dropped.setdefault(e.group, []).append((e, sent))
-            log.info("[%s] CHI TIET | cau thua BO: goc %s %.2f-%.2fs '%s' | moi %.3f-%.3fs '%s' giong %.3f | doc_lai %.3f"
-                     " | track phu timeline %.3fs", job.name, os.path.basename(e.path), e.start, e.end, e.text,
-                     sent.start, sent.end, sent.text, sent.similarity, e.reread_sim, speech_tl / US)
+            if e.reread_sim < pipeline.EXTRA_REREAD_SIM:
+                pl, _ = pipeline.compute_placements([sent], [pipeline.OriginalClip(speech_tl, core_len, "", 0, 0)],
+                                                    max(timeline_end, speech_tl + core_len), spans, None, [])
+                aux += pl
+                dropped.setdefault((e.group, run.get(e.group, 0)), []).append((e, sent))
+                log.info("[%s] CHI TIET | cau thua BO: goc %s %.2f-%.2fs '%s' | moi %.3f-%.3fs '%s' giong %.3f | doc_lai %.3f"
+                         " | track phu timeline %.3fs", job.name, os.path.basename(e.path), e.start, e.end, e.text,
+                         sent.start, sent.end, sent.text, sent.similarity, e.reread_sim, speech_tl / US)
+                continue
+            # doc lai (>= EXTRA_REREAD_SIM) -> giu nhu v1.2.6
+            run[e.group] = run.get(e.group, 0) + 1
+            next_speech = min((d["speech_us"] for d in place_dbg if d["core_us"][0] >= prev_end), default=timeline_end)
+            room = next_speech - prev_end
+            fits = room >= core_len + int(EXTRA_ROOM_SEC * US) and prev_end + core_len <= timeline_end
+            if fits:
+                trial = main + [(e, sent, speech_tl)]
+                new_pl, new_dbg = self._placements_with(trial, clips, by_clip, spans, onsets, timeline_end)
+                moved = [i for i, v in base_speech.items()
+                         if next((d["speech_us"] for d in new_dbg if d["clip"] == i), v) != v]
+                if not moved:
+                    main, placements, place_dbg = trial, new_pl, new_dbg
+            if fits and main and main[-1][0] is e:
+                where = f"đặt trên track chính sau câu {e.after + 1} (timeline {speech_tl / US:.1f}s)"
+            else:
+                pl, _ = pipeline.compute_placements([sent], [pipeline.OriginalClip(speech_tl, core_len, "", 0, 0)],
+                                                    max(timeline_end, speech_tl + core_len), spans, None, [])
+                aux += pl
+                where = (f"không đủ chỗ → track phụ '{draft_patch.extra_track_name(job.name)}' (tắt tiếng), "
+                         f"timeline {speech_tl / US:.1f}s")
+            kept.append(f"Voice {job.name} đọc câu '{sent.text[:80]}' — đoạn gốc {os.path.basename(e.path)} "
+                        f"{e.start:.1f}–{e.end:.1f}s giống 1 clip ({e.reread_sim:.2f}): có thể là đọc lại → KHÔNG bỏ, {where}.")
+            log.info("[%s] CHI TIET | cau thua GIU (doc lai %.3f): goc %s %.2f-%.2fs | moi %.3f-%.3fs '%s' -> %s", job.name,
+                     e.reread_sim, os.path.basename(e.path), e.start, e.end, sent.start, sent.end, sent.text, where)
         notes = []
         for items in dropped.values():
             (e0, s0), (e1, s1) = items[0], items[-1]
             text = " ".join(s.text for _, s in items)
             reread = max(e.reread_sim for e, _ in items)
+            where = (f"{os.path.basename(e0.path)} {e0.start:.1f}–{e1.end:.1f}s" if e1.path == e0.path else
+                     f"{os.path.basename(e0.path)} {e0.start:.1f}s → {os.path.basename(e1.path)} {e1.end:.1f}s")
             notes.append(f"Đã bỏ đoạn thừa {s0.start:.1f}–{s1.end:.1f}s: '{text[:80]}{'…' if len(text) > 80 else ''}'"
-                         f" — giọng gốc đã xóa (gốc {os.path.basename(e0.path)} {e0.start:.1f}–{e1.end:.1f}s) → track phụ "
-                         f"'{draft_patch.extra_track_name(job.name)}' (tắt tiếng) để kiểm tra."
+                         f" — giọng gốc đã xóa (gốc {where}) → track phụ '{draft_patch.extra_track_name(job.name)}'"
+                         " (tắt tiếng) để kiểm tra."
                          + (f" Đoạn gốc giống 1 clip ({reread:.2f}) — có thể là đọc lại, nên nghe."
                             if reread >= pipeline.EXTRA_REREAD_WARN else ""))
-        return pipeline.stack_placements(aux), notes
+        return placements, place_dbg, pipeline.stack_placements(aux), notes + kept
+
+    def _placements_with(self, main, clips, by_clip, spans, onsets, timeline_end):
+        """Xep lai track chinh co them cac cau thua giu lai (clip ao dat dung luc noi tren timeline). place_dbg tra ve chi
+        so clip THAT (cau thua: ("thua", thu tu))."""
+        items = [(c.target_start_us, ("c", i)) for i, c in enumerate(clips)]
+        items += [(tl, ("g", n)) for n, (_, _, tl) in enumerate(main)]
+        items.sort(key=lambda x: x[0])
+        clips2, sents2, onsets2, keys = [], [], [], []
+        for tl, (kind, x) in items:
+            if kind == "c":
+                clips2.append(clips[x])
+                sents2.append(by_clip[x])
+                onsets2.append(onsets[x] if onsets else 0.0)
+            else:
+                clips2.append(pipeline.OriginalClip(tl, 1, "", 0, 0))
+                sents2.append(main[x][1])
+                onsets2.append(0.0)
+            keys.append(x if kind == "c" else ("thua", x))
+        dbg = []
+        pl, _ = pipeline.compute_placements(sents2, clips2, timeline_end, spans, onsets2, dbg)
+        for d in dbg:
+            d["clip"] = keys[d["clip"]]
+        return pl, dbg
 
     def _pair_gaps(self, clips):
         """Khoang cach tren timeline (giay) giua 2 cau goc lien nhau theo thu tu doc.
