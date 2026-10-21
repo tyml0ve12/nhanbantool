@@ -529,7 +529,11 @@ class RunWorker(QThread):
                                f" nguong={sd.get('threshold', float('nan')):+.1f}dB(so floor)"
                                f" noi={v.speech_start:.3f}({'nang_luong' if sd.get('onset_by_energy') else '=cat_cu'})"
                                f"-{v.speech_end:.3f}({'nang_luong' if sd.get('offset_by_energy') else '=cat_cu'})"
-                               f" keo_dai={v.ext_start:.3f}-{v.ext_end:.3f}")
+                               f" keo_dai={v.ext_start:.3f}-{v.ext_end:.3f}"
+                               + "".join(f" keo_dai_{side}_rut={full:.3f}->{now:.3f}(am cau ben canh)"
+                                         for side, full, now in zip(("dau", "cuoi"), sd.get("ext_full", ()),
+                                                                    (v.ext_start, v.ext_end))
+                                         if abs(full - now) > 1e-6))
                 if i in by_place:
                     (target, source, duration, mute_head, mute_tail), pd = by_place[i]
                     row.append(f"dat tl={sec(target):.3f} src={sec(source):.3f} dur={sec(duration):.3f}"

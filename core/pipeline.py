@@ -315,6 +315,10 @@ TH1_MARGIN_SEC = 0.15        # TH1/TH2 tinh tren tieng noi + le 0.15s moi ben (k
 # ngan (< 3 khung) sau luc het noi khong bi rut mat khi TH1 phai rut phan nghe duoc (QA 8-A: 107 day cau 9 mat "d").
 SOUND_BELOW_PEAK_DB = 35
 SOUND_PAD_SEC = 0.05
+# Phan KEO DAI (tat tieng) chi phu khoang lang: dung truoc khung co am cua CAU BEN CANH them le 25ms -> CapCut khong
+# ve mau song cau ben canh o 2 dau clip (viec #7, 2026-10-21). Nguong = thap hon cua "con am" cau ben canh (dinh vung
+# cau do - 35 dB) va nen + 10 dB: chi dung "con am" con sot tieng tho/duoi am +11..18 dB tren nen (41: 76/124 clip).
+EXT_GUARD_SEC = 0.025
 
 
 def speech_threshold(levels, floor: float, fa: int, fb: int) -> float:
@@ -389,11 +393,18 @@ def voice_spans(sentences: list, levels, frame_sec: float, audio_duration: float
         lo, hi = present[k].end, present[k + 1].start
         cuts.append(valley(lo, hi) if hi > lo else (lo + hi) / 2)
         cut_how.append(f"valley({hi - lo:.2f}s)" if hi > lo else "giua(hi<=lo)")
-    spans = {}
+    bounds, sounds = [], []          # vung [a, b] tung cau + nguong con am cua vung (dung cho phan keo dai cau ben canh)
     for k, s in enumerate(present):
         a = cuts[k - 1] if k > 0 else max(0.0, s.start - EXTEND_SEC)
         b = cuts[k] if k + 1 < len(present) else min(audio_duration, s.end + EXTEND_SEC)
         a, b = min(a, s.start), max(b, s.end)
+        bounds.append((a, b))
+        sounds.append(float(np.percentile(levels[frame(a):frame(b) + 1], 95)) - SOUND_BELOW_PEAK_DB
+                      if len(levels) else 0.0)
+    guard = [min(x, floor + SPEECH_ABOVE_FLOOR_DB) for x in sounds]    # phan keo dai lan sang: dung truoc khung nay
+    spans = {}
+    for k, s in enumerate(present):
+        a, b = bounds[k]
         threshold = speech_threshold(levels, floor, frame(a), frame(b)) if len(levels) else 0.0
         # luc bat dau noi: doan co tieng dau tien tu a toi het cau; luc het noi: doan co tieng cuoi cung tu dau cau toi b
         on = first_speech(levels, threshold, frame(a), frame(s.end)) if len(levels) else None
@@ -403,10 +414,19 @@ def voice_spans(sentences: list, levels, frame_sec: float, audio_duration: float
         speech_start, speech_end = max(a, speech_start), min(b, max(speech_end, speech_start))
         ext_start = max(0.0, min(a, speech_start - EXTEND_SEC))
         ext_end = min(audio_duration, max(b, speech_end + EXTEND_SEC))
+        ext_full = (ext_start, ext_end)
+        if len(levels) and k > 0 and ext_start < a:      # lan sang vung cau truoc: dung sau khung con am cuoi cung
+            loud = [i for i in range(frame(ext_start), frame(a)) if levels[i] > guard[k - 1]]
+            if loud:
+                ext_start = min(a, (loud[-1] + 1) * frame_sec + EXT_GUARD_SEC)
+        if len(levels) and k + 1 < len(present) and ext_end > b:    # lan sang cau sau: dung truoc khung con am dau
+            loud = [i for i in range(frame(b) + 1, frame(ext_end) + 1) if levels[i] > guard[k + 1]]
+            if loud:
+                ext_end = max(b, loud[0] * frame_sec - EXT_GUARD_SEC)
         # con am (nguong thap hon, 1 khung du): tu dau vung toi luc bat dau noi / tu luc het noi toi cuoi vung
         # (khong ap nen + 10 dB: file nen cao -> moi khung deu tinh la con am -> loi = ca vung nghe duoc, khong rut gi)
         fa, fs, fe, fb = frame(a), frame(speech_start), frame(speech_end), frame(b)
-        sound = float(np.percentile(levels[fa:fb + 1], 95)) - SOUND_BELOW_PEAK_DB if len(levels) else 0.0
+        sound = sounds[k]
         first = next((i for i in range(fa, fs) if levels[i] > sound), None) if len(levels) else None
         last = next((i for i in range(fb, fe - 1, -1) if levels[i] > sound), None) if len(levels) else None
         sound_start = min(speech_start, first * frame_sec) if first is not None else speech_start
@@ -417,7 +437,8 @@ def voice_spans(sentences: list, levels, frame_sec: float, audio_duration: float
                 cut_start=cut_how[k - 1] if k > 0 else "mep (-0.5s)",
                 cut_end=cut_how[k] if k + 1 < len(present) else "mep (+0.5s)",
                 db_start=float(levels[frame(a)]) - floor, db_end=float(levels[frame(b)]) - floor,
-                threshold=threshold - floor, onset_by_energy=on is not None, offset_by_energy=off is not None)
+                threshold=threshold - floor, onset_by_energy=on is not None, offset_by_energy=off is not None,
+                ext_full=ext_full)
     return spans
 
 
