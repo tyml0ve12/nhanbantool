@@ -67,18 +67,17 @@ SHORT_INSERT_MAX_CLIPS = 2
 
 def short_insert_clips(clips: list) -> set:
     """Clip cua FILE PHU CHEN NGAN (vd file "keu goi binh luan" chen giua video, bai 120): file khong phai file doc dau,
-    <= SHORT_INSERT_MAX_CLIPS clip, moi clip nam GIUA cac clip cua file chinh (file nhieu clip nhat) tren timeline.
-    Giong moi co the khong doc (loi keu goi rieng tung ngon ngu) -> cau TUY CHON, vi tri doc theo timeline."""
+    <= SHORT_INSERT_MAX_CLIPS clip, nam GIUA cac clip cua 1 file khac tren timeline (giong goc 1 file hoac chia nhieu
+    phan: bai 123 chen giua cac clip cua phan 1). Giong moi co the khong doc (loi keu goi rieng tung ngon ngu) -> cau TUY CHON, vi tri doc theo timeline."""
     by_file = {}
     for i, c in enumerate(clips):
         by_file.setdefault(c.source_path, []).append(i)
     if len(by_file) < 2:
         return set()
-    main = max(by_file.values(), key=len)
     first = clips[reading_order(clips)[0]].source_path
     out = set()
     for path, idx in by_file.items():
-        if path != first and idx is not main and len(idx) <= SHORT_INSERT_MAX_CLIPS                 and all(main[0] < i < main[-1] for i in idx):
+        if path != first and len(idx) <= SHORT_INSERT_MAX_CLIPS and                 any(o[0] < idx[0] and idx[-1] < o[-1] for p, o in by_file.items() if p != path):
             out.update(idx)
     return out
 
