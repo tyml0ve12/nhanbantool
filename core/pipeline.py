@@ -97,6 +97,7 @@ EXTRA_MIN_GAP_SEC = 0.3       # doan ho ngan hon -> bo qua (cho cat giua 2 clip)
 EXTRA_MIN_SPEECH_SEC = 1.0    # tong khung co tieng (nang luong) trong doan ho
 EXTRA_MIN_WORDS = 3           # so chu whisper co trung diem trong doan ho
 EXTRA_REREAD_SIM = 0.7        # giong noi dung 1 clip bat ky -> "doc lai / loi voice", khong phai cau thua
+EXTRA_REREAD_WARN = 0.55      # cau thua giong 1 clip tu muc nay (duoi EXTRA_REREAD_SIM) -> canh bao "co the doc lai"
 EXTRA_SENTENCE_END = re.compile(r"[.!?。！？…]+[\"'”’»)\]]*$")
 
 
@@ -431,6 +432,18 @@ def original_onsets(clips: list, source_map: dict, words_by_file: dict, debug: l
             src = "mac dinh 0 (khong co chu)" if words else "mac dinh 0 (khong co file giong goc)"
         if debug is not None:
             debug.append(src)
+    return out
+
+
+def stack_placements(placements: list) -> list:
+    """Track phu (cau thua, da tat tieng): doan nao chong doan truoc thi DAY ra sau cho vua cham (cat tu file giu
+    nguyen) - track phu duoc lech vi tat tieng, mien khong chong (validate_dubbed)."""
+    out = []
+    for p in sorted(placements):
+        p = list(p)
+        if out and p[0] < out[-1][0] + out[-1][2]:
+            p[0] = out[-1][0] + out[-1][2]
+        out.append(tuple(p))
     return out
 
 

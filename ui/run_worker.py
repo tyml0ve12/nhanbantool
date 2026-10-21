@@ -282,6 +282,9 @@ class RunWorker(QThread):
             if e.kind == "thua":
                 self.log.emit(f"Giọng gốc có đoạn không thuộc clip nào (câu gốc đã xóa khỏi timeline?): {where} "
                               f"'{e.text[:80]}' → giọng mới đọc câu này sẽ thành đoạn riêng.")
+                if e.reread_sim >= pipeline.EXTRA_REREAD_WARN:
+                    self.log.emit(f"Cảnh báo: đoạn {where} giống 1 clip gốc ({e.reread_sim:.2f}) — có thể là đoạn "
+                                  "đọc lại, nên nghe kiểm tra.")
             elif e.kind == "manh":
                 self.log.emit(f"Cảnh báo: giọng gốc {where} có đoạn ngắn không thuộc clip nào ('{e.text[:60]}') "
                               "— có thể clip bị cắt lẹm, nên kiểm tra.")
@@ -624,13 +627,16 @@ class RunWorker(QThread):
                                                     max(timeline_end, speech_tl + core_len), spans, None, one)
                 aux += pl
                 where = (f"không đủ chỗ (trống {room / US:.1f}s, cần {(core_len + int(EXTRA_ROOM_SEC * US)) / US:.1f}s) → "
-                         f"track phụ '{draft_patch.extra_track_name(job.name)}' (tắt tiếng), timeline {speech_tl / US:.1f}s")
+                         f"track phụ '{draft_patch.extra_track_name(job.name)}' (tắt tiếng), timeline {speech_tl / US:.1f}s"
+                         " (lùi ra sau nếu chạm đoạn thừa khác)")
+            reread = (f" Đoạn gốc giống 1 clip ({e.reread_sim:.2f}) — có thể là đoạn đọc lại, nên nghe."
+                      if e.reread_sim >= pipeline.EXTRA_REREAD_WARN else "")
             notes.append(f"Voice {job.name} có câu THỪA (câu gốc đã xóa khỏi timeline): '{sent.text[:80]}' — gốc "
-                         f"{os.path.basename(e.path)} {e.start:.1f}–{e.end:.1f}s → {where}.")
+                         f"{os.path.basename(e.path)} {e.start:.1f}–{e.end:.1f}s → {where}.{reread}")
             log.info("[%s] CHI TIET | cau thua: goc %s %.2f-%.2fs '%s' | moi %.3f-%.3fs '%s' giong %.3f | loi %.3fs,"
                      " trong %.3fs -> %s", job.name, os.path.basename(e.path), e.start, e.end, e.text, sent.start,
                      sent.end, sent.text, sent.similarity, core_len / US, room / US, where)
-        return placements, place_dbg, sorted(aux), notes
+        return placements, place_dbg, pipeline.stack_placements(aux), notes
 
     def _placements_with(self, main, clips, by_clip, spans, onsets, timeline_end):
         """Xep lai track chinh co them cac cau thua (clip ao dat dung luc noi tren timeline). place_dbg tra ve chi so clip
