@@ -814,8 +814,8 @@ class MainWindow(QMainWindow):
 
     def _log(self, text):
         log.info(text)
-        # To mau (noi dung giu nguyen): LOI / voice THIEU cau -> do; cau THUA / canh bao -> cam
-        if "LỖI" in text or "THIẾU câu" in text:
+        # To mau (noi dung giu nguyen): LOI / voice THIEU cau / duoi voice dat som -> do; cau THUA / canh bao -> cam
+        if "LỖI" in text or "THIẾU câu" in text or "Đuôi voice" in text:
             color = "#ff6b6b"
         elif "Cảnh báo" in text or "câu THỪA" in text or "không thuộc clip nào" in text:
             color = "#e0b04a"

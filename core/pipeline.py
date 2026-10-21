@@ -45,16 +45,42 @@ def _walk_limited(root, depth):
         yield dirpath, filenames
 
 
-def reading_order(clips: list) -> list:
+def reading_order(clips: list, by_timeline=frozenset()) -> list:
     """Thu tu DOC cua cac cau trong file giong goc (vi tri source_timerange) - co
     the KHAC thu tu tren timeline (vd cau tieu de doc dau tien nhung duoc keo ra
     giua video). Audio ngon ngu moi doc theo cung kich ban -> cung thu tu DOC nay.
     Nhieu file nguon: file nao xuat hien som tren timeline truoc, trong file theo vi tri.
+    by_timeline: clip xep theo TIMELINE (ngay sau clip khac dung truoc no tren timeline) - xem short_insert_clips.
     Tra ve danh sach chi so clip (theo timeline) xep theo thu tu doc."""
     first_seen = {}
     for i, c in enumerate(clips):
         first_seen.setdefault(c.source_path, i)
-    return sorted(range(len(clips)), key=lambda i: (first_seen[clips[i].source_path], clips[i].source_start_us, i))
+    order = sorted((i for i in range(len(clips)) if i not in by_timeline),
+                   key=lambda i: (first_seen[clips[i].source_path], clips[i].source_start_us, i))
+    for i in sorted(by_timeline):           # clip i - 1 (ke ca clip chen) da co trong order
+        order.insert(order.index(i - 1) + 1 if i else 0, i)
+    return order
+
+
+SHORT_INSERT_MAX_CLIPS = 2
+
+
+def short_insert_clips(clips: list) -> set:
+    """Clip cua FILE PHU CHEN NGAN (vd file "keu goi binh luan" chen giua video, bai 120): file khong phai file doc dau,
+    <= SHORT_INSERT_MAX_CLIPS clip, moi clip nam GIUA cac clip cua file chinh (file nhieu clip nhat) tren timeline.
+    Giong moi co the khong doc (loi keu goi rieng tung ngon ngu) -> cau TUY CHON, vi tri doc theo timeline."""
+    by_file = {}
+    for i, c in enumerate(clips):
+        by_file.setdefault(c.source_path, []).append(i)
+    if len(by_file) < 2:
+        return set()
+    main = max(by_file.values(), key=len)
+    first = clips[reading_order(clips)[0]].source_path
+    out = set()
+    for path, idx in by_file.items():
+        if path != first and idx is not main and len(idx) <= SHORT_INSERT_MAX_CLIPS                 and all(main[0] < i < main[-1] for i in idx):
+            out.update(idx)
+    return out
 
 
 def resolve_media(path_in_draft: str, search_roots: list) -> str:

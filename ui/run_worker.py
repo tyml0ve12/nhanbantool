@@ -23,6 +23,7 @@ MODE_BOTH = "both"
 
 MIN_SUBTITLE_COVER = 0.8   # phu de phu it hon muc nay -> nhan dang giong goc thay the
 EXTRA_ROOM_SEC = 0.3       # cau thua dat tren track chinh khi khoang trong >= loi cau thua + 0.3s (chot 2026-10-20)
+TAIL_EARLY_SEC = 30        # doan cuoi voice dat truoc clip cuoi hon 30s -> canh bao do "Duoi voice" (viec #6b)
 
 
 def output_name(video_path: str, language: str) -> str:
@@ -75,6 +76,7 @@ class RunWorker(QThread):
         self._progress_lock = threading.Lock()
         self._driver_warned = False
         self._order = []
+        self._optional = set()      # clip file phu chen ngan (cau tuy chon)
         self._onsets = None
         self._onset_src = None      # nguon onset tung clip (ghi log chi tiet)
         self._text_src = None       # nguon noi dung tung cau goc (ghi log chi tiet)
@@ -107,14 +109,6 @@ class RunWorker(QThread):
 
         draft = draft_patch.load_draft(cfg.draft_files[0])
         clips = pipeline.read_original_clips(draft, cfg.track_index)
-        # Can cau theo THU TU DOC trong file giong goc (co the khac thu tu timeline,
-        # vd cau tieu de doc dau tien nhung keo ra giua video), roi dat lai theo timeline.
-        self._order = pipeline.reading_order(clips)
-        moved = sum(1 for k, i in enumerate(self._order) if k != i)
-        if moved:
-            self.log.emit(f"Track gốc có {moved} câu đặt khác thứ tự đọc (vd câu tiêu đề kéo ra giữa video) "
-                          "→ căn theo thứ tự đọc trong file giọng gốc.")
-        durations = [clips[i].target_duration_us / US for i in self._order]
         timeline_end = int(draft.get("duration", 0)) or (clips[-1].target_start_us + clips[-1].target_duration_us)
         self.log.emit(f"Bắt đầu: {len(cfg.languages)} ngôn ngữ · {len(clips)} câu gốc")
 
@@ -126,6 +120,19 @@ class RunWorker(QThread):
         self.progress.emit(2)
         source_texts = self._original_texts(draft, clips)
         self.progress.emit(8)
+        # Can cau theo THU TU DOC trong file giong goc (co the khac thu tu timeline,
+        # vd cau tieu de doc dau tien nhung keo ra giua video), roi dat lai theo timeline.
+        # File phu chen ngan (can noi dung de so nghia): xep theo timeline, cau tuy chon.
+        self._optional = pipeline.short_insert_clips(clips) if source_texts else set()
+        self._order = pipeline.reading_order(clips, self._optional)
+        for i in sorted(self._optional):
+            self.log.emit(f"Câu {i + 1} thuộc file phụ chèn ngắn '{os.path.basename(clips[i].source_path)}' "
+                          "→ xếp theo vị trí trên timeline, voice mới có thể không đọc (câu tùy chọn).")
+        moved = sum(1 for k, i in enumerate(self._order) if k != i)
+        if moved:
+            self.log.emit(f"Track gốc có {moved} câu đặt khác thứ tự đọc (vd câu tiêu đề kéo ra giữa video) "
+                          "→ căn theo thứ tự đọc trong file giọng gốc.")
+        durations = [clips[i].target_duration_us / US for i in self._order]
 
         # Che do "Ca hai": ghi + ap dung DRAFT CapCut TRUOC (mo CapCut kiem tra duoc
         # ngay), render mp4 SAU. Che do chi xuat mp4: render chong voi nhan dang
@@ -346,7 +353,7 @@ class RunWorker(QThread):
         texts_in_order = [source_texts[x] if kind == "c" else x.text for kind, x in plan] if source_texts else None
         split_args = dict(labels=[x + 1 if kind == "c" else f"thừa sau {x.after + 1}" for kind, x in plan],
                           pair_gaps=self._plan_gaps(clips, plan),
-                          ghosts={k for k, (kind, _) in enumerate(plan) if kind == "g"})
+                          ghosts={k for k, (kind, x) in enumerate(plan) if kind == "g" or x in self._optional})
         embedder = self._embed() if source_texts else None
         try:
             result = segmenter.split_sentences(words, durations_ext, silences, dur, texts_in_order, embedder,
@@ -399,6 +406,13 @@ class RunWorker(QThread):
                                f"(timeline {c.target_start_us / US:.1f}–{(c.target_start_us + c.target_duration_us) / US:.1f}s)"
                                " → để trống chỗ câu này.")
         warnings[0:0] = extra_notes
+        tail = self._early_tail(placements, clips)
+        if tail:
+            warnings.insert(0, tail)
+        for i in sorted(self._optional):
+            if by_clip[i] is None:
+                warnings.insert(0, f"Voice {job.name} không có câu {i + 1} (file phụ "
+                                   f"'{os.path.basename(clips[i].source_path)}' – có thể là lời kêu gọi riêng) → để trống.")
         for label, best in result.debug.get("unsure_missing", []):
             warnings.append(f"Câu {label} có thể bị thiếu trong voice (giống nhất {best:.2f}) — vẫn xếp như cũ, nên nghe kiểm tra.")
         if report.far:
@@ -497,6 +511,8 @@ class RunWorker(QThread):
                 best = dict(dbg.get("missing_sim", [])).get(label)
                 row.append("THIEU: giong moi khong doc cau nay (giong nhat cuc bo "
                            f"{best:.3f}) -> de trong" if best is not None else "THIEU -> de trong")
+            elif s is None and i in self._optional:
+                row.append("KHONG CO trong giong moi (file phu chen ngan, cau tuy chon) -> de trong")
             elif s is None:
                 row.append(f"GOP vao cau {merged_into.get(label, '?')} (khong co doan rieng)")
             else:
@@ -573,6 +589,19 @@ class RunWorker(QThread):
             nxt = self._order[k + 1] if k + 1 < len(self._order) else None
             plan += [("g", e) for e in extras if e.after == i and e.before == nxt]
         return plan
+
+    @staticmethod
+    def _early_tail(placements, clips) -> str:
+        """Luoi an toan: doan CUOI file voice dat cach clip cuoi tren timeline > TAIL_EARLY_SEC (vd bai 120: duoi cau
+        keu goi bi tach sang clip chen giua video) -> canh bao do."""
+        if not placements or not clips:
+            return ""
+        t, src, d, head, tail = max(placements, key=lambda p: p[1] + p[2])
+        if t >= clips[-1].target_start_us - TAIL_EARLY_SEC * US:
+            return ""
+        return (f"Đuôi voice ({(src + head) / US:.1f}–{(src + d - tail) / US:.1f}s) đặt ở timeline "
+                f"{(t + head) / US:.1f}s, trước câu cuối ({clips[-1].target_start_us / US:.1f}s) hơn "
+                f"{TAIL_EARLY_SEC}s — kiểm tra thứ tự câu.")
 
     def _plan_gaps(self, clips, plan) -> list:
         """pair_gaps theo thu tu doc co cau ma (cap co cau ma: khong gop duoc, gia tri khong dung)."""
