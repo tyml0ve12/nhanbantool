@@ -250,28 +250,36 @@ class RunWorker(QThread):
         # vd tren Google Drive: <bai>\voice nhân bản\*.mp3 va <bai>\<bai> _ Lan\*.tbn*.mp3 - bai 121);
         # thu muc cha cua project (vd CapCut Drafts chua ca tram project) sau cung
         search_roots = [self.config.project_dir]
+        home = os.path.normcase(os.path.expanduser("~"))
         for job in self.config.languages:
             if job.parts:
                 d = os.path.dirname(os.path.abspath(job.parts[0]))
                 for r in (d, os.path.dirname(d)):
-                    if r not in search_roots:
-                        search_roots.append(r)
+                    # bo goc o dia / thu muc nguoi dung (duyet sau 3 cap ca AppData: cham, de lay nham file trung ten)
+                    nr = os.path.normcase(r)
+                    if r in search_roots or nr == home or os.path.dirname(nr) == nr:
+                        continue
+                    search_roots.append(r)
         search_roots.append(os.path.dirname(self.config.project_dir))
         sources = pipeline.resolve_original_sources(clips, search_roots)
+        shown = {}      # duong dan doc (ban chep neu co) -> ten that de hien
         for key, path in list(sources.items()):
             if path and path_too_long(path):      # giong goc nam sau (Google Drive) -> chep ra cache duong dan ngan
                 try:
                     sources[key] = short_local_copy(path)
+                    shown[sources[key]] = os.path.basename(path)
                     self.log.emit(f"Giọng gốc {os.path.basename(path)}: đường dẫn quá dài → dùng bản chép trong cache.")
                 except OSError as e:
                     log.warning("Khong chep duoc giong goc %s: %s", path, e)
                     sources[key] = ""
+            if path and not os.path.normcase(path).startswith(os.path.normcase(self.config.project_dir)):
+                log.info("Giong goc tim thay ngoai project: %s", path)
         words_by_file = {}
         for path in sorted({p for p in sources.values() if p}):
             words, lang, _ = speech.transcribe_words(path, self.config.whisper_model, self.config.device,
                                                      lambda p: None, self.log.emit, self._stopped, self._models)
             words_by_file[path] = words
-            self.log.emit(f"Đã nhận dạng giọng gốc {os.path.basename(path)} ({lang}).")
+            self.log.emit(f"Đã nhận dạng giọng gốc {shown.get(path, os.path.basename(path))} ({lang}).")
             log.info("Giong goc %s: %s, %d tu", path, lang, len(words))
         missing = sorted(os.path.basename(p.replace("\\", "/")) for p, real in sources.items() if not real)
         if missing:
