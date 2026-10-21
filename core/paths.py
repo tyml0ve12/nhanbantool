@@ -17,6 +17,13 @@ def long_path_message(path: str) -> str:
             "Hãy đổi tên thư mục / tên ngôn ngữ / tên file ngắn hơn, hoặc chuyển project tới thư mục ngắn hơn.")
 
 
+def is_network_path(path: str) -> bool:
+    """Duong dan mang UNC (\\\\server\\share\\... hoac //server/...) lay tu draft (vd //xuat-video/...): kiem tra ton tai
+    (isfile / exists) co the treo cho mang rat lau khi may chu khong con -> khong kiem, tim theo ten (T-023)."""
+    p = str(path or "").replace("\\", "/")
+    return p.startswith("//")
+
+
 def short_local_copy(path: str) -> str:
     """File NGUON (chi doc) co duong dan qua dai (vd giong goc tren Google Drive nhieu cap, bai 121) -> chep ra
     <app>\\cache\\nguon\\<ma bam><duoi> (giu mtime) va tra ve ban chep; ffmpeg / whisper doc duoc. Ban chep

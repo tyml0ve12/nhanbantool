@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from core.capcut_project import ProjectError, US, AUDIO_EXTS
+from core.paths import is_network_path
 
 SEARCH_DEPTH = 3
 
@@ -85,8 +86,8 @@ def short_insert_clips(clips: list) -> set:
 
 def resolve_media(path_in_draft: str, search_roots: list) -> str:
     """Duong dan trong draft hay bi cu (project da chuyen o dia/may). Tim lai
-    file cung ten trong thu muc project."""
-    if path_in_draft and os.path.isfile(path_in_draft):
+    file cung ten trong thu muc project. Duong dan mang (UNC): khong kiem ton tai (treo cho mang), tim theo ten."""
+    if path_in_draft and not is_network_path(path_in_draft) and os.path.isfile(path_in_draft):
         return os.path.normpath(path_in_draft)
     name = os.path.basename(path_in_draft.replace("\\", "/"))
     if not name:

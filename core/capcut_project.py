@@ -11,6 +11,8 @@ import os
 import subprocess
 from dataclasses import dataclass, field
 
+from core.paths import is_network_path
+
 DRAFT_FILE = "draft_content.json"
 DRAFTS_DIR_NAME = "File Drafts"
 AUDIO_EXTS = (".mp3", ".wav", ".m4a", ".aac", ".flac")
@@ -75,7 +77,8 @@ def list_draft_files(drafts_dir: str) -> list:
 
 
 def _guess_video(project_root: str, video_path_in_draft: str) -> str:
-    if video_path_in_draft and os.path.isfile(video_path_in_draft):
+    # Duong dan mang (UNC): khong kiem ton tai (treo cho mang), tim theo ten canh project
+    if video_path_in_draft and not is_network_path(video_path_in_draft) and os.path.isfile(video_path_in_draft):
         return video_path_in_draft
     # Duong dan trong draft hay bi cu (project da bi chuyen o dia) -> tim file
     # cung ten canh project, roi toi bat ky .mp4 nao canh project.
