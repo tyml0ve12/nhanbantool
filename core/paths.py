@@ -17,6 +17,25 @@ def long_path_message(path: str) -> str:
             "Hãy đổi tên thư mục / tên ngôn ngữ / tên file ngắn hơn, hoặc chuyển project tới thư mục ngắn hơn.")
 
 
+def short_local_copy(path: str) -> str:
+    """File NGUON (chi doc) co duong dan qua dai (vd giong goc tren Google Drive nhieu cap, bai 121) -> chep ra
+    <app>\\cache\\nguon\\<ma bam><duoi> (giu mtime) va tra ve ban chep; ffmpeg / whisper doc duoc. Ban chep
+    duoc dung lai khi file goc khong doi (cung kich thuoc + mtime)."""
+    if not path_too_long(path):
+        return path
+    import hashlib
+    src = "\\\\?\\" + os.path.abspath(path) if os.name == "nt" else path
+    st = os.stat(src)
+    key = f"{os.path.abspath(path)}|{st.st_size}|{int(st.st_mtime)}"
+    folder = os.path.join(get_app_dir(), "cache", "nguon")
+    os.makedirs(folder, exist_ok=True)
+    dst = os.path.join(folder, hashlib.sha1(key.encode("utf-8")).hexdigest()[:16] + os.path.splitext(path)[1])
+    if not os.path.isfile(dst):
+        shutil.copy2(src, dst + ".tmp")
+        os.replace(dst + ".tmp", dst)
+    return dst
+
+
 def get_app_dir() -> str:
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 

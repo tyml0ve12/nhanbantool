@@ -13,7 +13,7 @@ from PySide6.QtCore import QThread, Signal
 
 from core import audio, draft_patch, logo, parts, pipeline, render, segmenter, speech
 from core.capcut_project import ProjectError, US, is_capcut_running
-from core.paths import long_path_message, path_too_long
+from core.paths import long_path_message, path_too_long, short_local_copy
 
 log = logging.getLogger("run_worker")
 
@@ -246,9 +246,26 @@ class RunWorker(QThread):
         self._onsets = None
         self._onset_src = None
         self._extras = []
-        # Tim trong project truoc; thu muc cha (vd CapCut Drafts chua ca tram project) sau cung
-        search_roots = [self.config.project_dir, os.path.dirname(self.config.project_dir)]
+        # Tim trong project truoc; roi thu muc chua voice nhan ban + thu muc cha cua no (giong goc hay nam canh,
+        # vd tren Google Drive: <bai>\voice nhân bản\*.mp3 va <bai>\<bai> _ Lan\*.tbn*.mp3 - bai 121);
+        # thu muc cha cua project (vd CapCut Drafts chua ca tram project) sau cung
+        search_roots = [self.config.project_dir]
+        for job in self.config.languages:
+            if job.parts:
+                d = os.path.dirname(os.path.abspath(job.parts[0]))
+                for r in (d, os.path.dirname(d)):
+                    if r not in search_roots:
+                        search_roots.append(r)
+        search_roots.append(os.path.dirname(self.config.project_dir))
         sources = pipeline.resolve_original_sources(clips, search_roots)
+        for key, path in list(sources.items()):
+            if path and path_too_long(path):      # giong goc nam sau (Google Drive) -> chep ra cache duong dan ngan
+                try:
+                    sources[key] = short_local_copy(path)
+                    self.log.emit(f"Giọng gốc {os.path.basename(path)}: đường dẫn quá dài → dùng bản chép trong cache.")
+                except OSError as e:
+                    log.warning("Khong chep duoc giong goc %s: %s", path, e)
+                    sources[key] = ""
         words_by_file = {}
         for path in sorted({p for p in sources.values() if p}):
             words, lang, _ = speech.transcribe_words(path, self.config.whisper_model, self.config.device,
