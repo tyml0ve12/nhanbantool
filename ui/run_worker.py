@@ -688,8 +688,9 @@ class RunWorker(QThread):
     def _edge_ramps(placements, levels) -> list:
         """Vuot am luong tung doan [(dau_us, cuoi_us)]: mep nghe duoc nam giua tieng TO (muc to nhat +-20ms > nen +
         EDGE_LOUD_DB - giong doc lien, khong co cho lang de cat) -> EDGE_RAMP_US thay vi MUTE_RAMP_US (T-001). Cho cat
-        / luc noi khong doi."""
-        if not len(levels):
+        / luc noi khong doi. Mep DAU / CUOI file voice (khong co cau ben canh, vd 44 Anh cau 4 bat dau 0.01s) giu
+        MUTE_RAMP_US: vuot dai lam nho chu dau (Tester 22/10)."""
+        if not len(levels) or not placements:
             return []
         floor = pipeline.level_floor(levels)
 
@@ -697,10 +698,12 @@ class RunWorker(QThread):
             f = int(round(t_us / US / audio.LEVEL_FRAME_SEC))
             return float(levels[max(0, f - 2):max(1, f + 3)].max()) > floor + EDGE_LOUD_DB
 
+        first = min(range(len(placements)), key=lambda k: placements[k][1])
+        last = max(range(len(placements)), key=lambda k: placements[k][1] + placements[k][2])
         out = []
-        for target, source, dur, head, tail in (p[:5] for p in placements):
-            out.append((EDGE_RAMP_US if loud(source + head) else draft_patch.MUTE_RAMP_US,
-                        EDGE_RAMP_US if loud(source + dur - tail) else draft_patch.MUTE_RAMP_US))
+        for k, (target, source, dur, head, tail) in enumerate(p[:5] for p in placements):
+            out.append((EDGE_RAMP_US if k != first and loud(source + head) else draft_patch.MUTE_RAMP_US,
+                        EDGE_RAMP_US if k != last and loud(source + dur - tail) else draft_patch.MUTE_RAMP_US))
         return out
 
     @staticmethod
