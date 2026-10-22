@@ -171,14 +171,18 @@ def build_dubbed_draft(draft: dict, track_index: int, languages: list) -> dict:
         d["tracks"].append(new_track)
         if lang.extra_placements:
             extra = _new_dub_track(d, orig_track, template_seg, index, materials, material,
-                                   extra_track_name(lang.name), lang.extra_placements)
-            set_track_muted(extra, True)        # track phu cau thua luon tat tieng
+                                   extra_track_name(lang.name), lang.extra_placements, silent=True)
+            set_track_muted(extra, True)        # track phu cau thua luon tat tieng (nut track + volume doan = 0)
             d["tracks"].append(extra)
     return d
 
 
-def _new_dub_track(d, orig_track, template_seg, index, materials, material, name, placements, ramps=None) -> dict:
-    """1 track long tieng (chua gan vao draft): cac doan cat tu material theo placements (ramps: vuot tung doan)."""
+def _new_dub_track(d, orig_track, template_seg, index, materials, material, name, placements, ramps=None,
+                   silent=False) -> dict:
+    """1 track long tieng (chua gan vao draft): cac doan cat tu material theo placements (ramps: vuot tung doan).
+    silent=True (track phu cau thua): volume tung doan = 0, khong keyframe -> cau thua KHONG phat ra tieng ke ca
+    khi nguoi dung bat nut loa cua track (bai 48: nguoi dung thay track phu van co tieng). Muon nghe lai thi keo
+    volume doan len trong CapCut (last_nonzero_volume = 1.0)."""
     track_pos = len(d["tracks"])
     new_track = {k: copy.deepcopy(v) for k, v in orig_track.items() if k != "segments"}
     new_track["id"] = _new_id()
@@ -203,6 +207,9 @@ def _new_dub_track(d, orig_track, template_seg, index, materials, material, name
         # chong len keyframe tat tieng cua tool (Tool edit nhac da gap: CapCut ap dung ca hai).
         seg["common_keyframes"] = mute_keyframes(int(dur_us), int(mute_head), int(mute_tail), int(source_us),
                                                  int(ramp_head), int(ramp_tail))
+        if silent:
+            seg["volume"] = 0.0             # keyframe am luong se de len volume doan -> bo keyframe
+            seg["common_keyframes"] = []
         if "keyframe_refs" in seg:
             seg["keyframe_refs"] = []
         seg["extra_material_refs"] = _clone_refs(template_seg.get("extra_material_refs", []),
