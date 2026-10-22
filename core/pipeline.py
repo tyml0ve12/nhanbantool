@@ -63,6 +63,26 @@ def reading_order(clips: list, by_timeline=frozenset()) -> list:
     return order
 
 
+def timeline_order(clips: list, by_timeline=frozenset()) -> list:
+    """Thu tu doc PHUONG AN B (T-026, bai 323: file "voice bổ sung" co clip XEN RAI RAC tren timeline -> reading_order
+    don het xuong cuoi -> tach cau loi): file doc dau + chuoi PHAN danh so lien nhau (_next_part) giu thu tu doc nhu
+    reading_order; clip cua moi file KHAC xep theo TIMELINE (ngay sau clip dung truoc no tren timeline)."""
+    if not clips:
+        return []
+    files = []
+    for c in clips:
+        if c.source_path not in files:
+            files.append(c.source_path)
+    chain = [clips[reading_order(clips)[0]].source_path]
+    while True:
+        nxt = next((f for f in files if f not in chain and _next_part(chain[-1], f)), None)
+        if nxt is None:
+            break
+        chain.append(nxt)
+    others = {i for i, c in enumerate(clips) if c.source_path not in chain}
+    return reading_order(clips, set(by_timeline) | others)
+
+
 SHORT_INSERT_MAX_CLIPS = 2
 
 

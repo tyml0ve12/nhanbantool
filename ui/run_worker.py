@@ -25,6 +25,7 @@ MIN_SUBTITLE_COVER = 0.8   # phu de phu it hon muc nay -> nhan dang giong goc th
 EXTRA_ROOM_SEC = 0.3       # cau thua GIU (doc lai) dat track chinh khi khoang trong >= loi cau + 0.3s
 EDGE_LOUD_DB = 15           # mep nghe duoc to hon nen muc nay = nam giua tieng noi -> vuot dai (T-001, COO chot 15)
 EDGE_RAMP_US = 25_000       # vuot 25ms (CapCut + mp4) thay vi 10ms o mep giua tieng to
+ALT_ORDER_MIN_GAIN = 0.02   # phuong an B (T-026) chi dung khi do khop cao hon ro (hoac thu tu cu loi)
 TAIL_EARLY_SEC = 30        # doan cuoi voice dat truoc clip cuoi hon 30s -> canh bao do "Duoi voice" (viec #6b)
 
 
@@ -78,6 +79,7 @@ class RunWorker(QThread):
         self._progress_lock = threading.Lock()
         self._driver_warned = False
         self._order = []
+        self._alt_order = None      # thu tu doc phuong an B (T-026)
         self._optional = set()      # clip file phu chen ngan (cau tuy chon)
         self._onsets = None
         self._onset_src = None      # nguon onset tung clip (ghi log chi tiet)
@@ -127,6 +129,10 @@ class RunWorker(QThread):
         # File phu chen ngan (can noi dung de so nghia): xep theo timeline, cau tuy chon.
         self._optional = pipeline.short_insert_clips(clips) if source_texts else set()
         self._order = pipeline.reading_order(clips, self._optional)
+        # Phuong an B (T-026): file khac (bo sung / loi voice) theo timeline - chi dung khi tach cau loi
+        self._alt_order = pipeline.timeline_order(clips, self._optional) if source_texts else None
+        if self._alt_order == self._order:
+            self._alt_order = None
         for i in sorted(self._optional):
             self.log.emit(f"Câu {i + 1} thuộc file phụ chèn ngắn '{os.path.basename(clips[i].source_path)}' "
                           "→ xếp theo vị trí trên timeline, voice mới có thể không đọc (câu tùy chọn).")
@@ -385,27 +391,66 @@ class RunWorker(QThread):
 
         self.language_status.emit(job.row, "Đang tách câu…", "run")
         silences = audio.detect_silences(job.audio_path)
-        loose = False
-        plan = self._reading_plan(clips, source_texts)
-        durations_ext = [clips[x].target_duration_us / US if kind == "c" else x.end - x.start for kind, x in plan]
-        texts_in_order = [source_texts[x] if kind == "c" else x.text for kind, x in plan] if source_texts else None
-        split_args = dict(labels=[x + 1 if kind == "c" else f"thừa sau {x.after + 1}" for kind, x in plan],
-                          pair_gaps=self._plan_gaps(clips, plan),
-                          ghosts={k for k, (kind, _) in enumerate(plan) if kind == "g"},
-                          optional={k for k, (kind, x) in enumerate(plan) if kind == "c" and x in self._optional})
         embedder = self._embed() if source_texts else None
+        state = {"silences": silences, "loose": False}
+
+        def segment(order):
+            plan = self._reading_plan(clips, source_texts, order)
+            durations_ext = [clips[x].target_duration_us / US if kind == "c" else x.end - x.start for kind, x in plan]
+            texts_in_order = [source_texts[x] if kind == "c" else x.text for kind, x in plan] if source_texts else None
+            split_args = dict(labels=[x + 1 if kind == "c" else f"thừa sau {x.after + 1}" for kind, x in plan],
+                              pair_gaps=self._plan_gaps(clips, plan),
+                              ghosts={k for k, (kind, _) in enumerate(plan) if kind == "g"},
+                              optional={k for k, (kind, x) in enumerate(plan) if kind == "c" and x in self._optional})
+            try:
+                result = segmenter.split_sentences(words, durations_ext, state["silences"], dur, texts_in_order,
+                                                   embedder, min_pause=segmenter.LOOSE_MIN_PAUSE if state["loose"]
+                                                   else segmenter.MIN_PAUSE, **split_args)
+            except segmenter.TooFewPausesError as e:
+                if state["loose"]:
+                    raise
+                # Doc qua lien mach (vd tieng A Rap) -> do lai khoang lang nhay hon roi thu lai
+                log.info("%s: %s -> do lai khoang lang nhay hon", job.name, e)
+                self.log.emit(f"[{job.name}] Audio đọc liền mạch, ít chỗ ngắt → đo lại khoảng lặng nhạy hơn…")
+                state["silences"] = audio.detect_silences(job.audio_path, noise_db=segmenter.LOOSE_NOISE_DB,
+                                                          min_len=segmenter.LOOSE_MIN_PAUSE)
+                state["loose"] = True
+                result = segmenter.split_sentences(words, durations_ext, state["silences"], dur, texts_in_order,
+                                                   embedder, min_pause=segmenter.LOOSE_MIN_PAUSE, **split_args)
+            return plan, result
+
+        # T-026 (bai 323): file bo sung xen rai rac tren timeline -> thu tu doc theo file don chung xuong cuoi -> tach cau
+        # LOI hoac do khop < WARN_CORRELATION -> thu phuong an B (file khac theo timeline), lay lan tot hon
+        alt = getattr(self, "_alt_order", None)
         try:
-            result = segmenter.split_sentences(words, durations_ext, silences, dur, texts_in_order, embedder,
-                                               **split_args)
-        except segmenter.TooFewPausesError as e:
-            # Doc qua lien mach (vd tieng A Rap) -> do lai khoang lang nhay hon roi thu lai
-            log.info("%s: %s -> do lai khoang lang nhay hon", job.name, e)
-            self.log.emit(f"[{job.name}] Audio đọc liền mạch, ít chỗ ngắt → đo lại khoảng lặng nhạy hơn…")
-            silences = audio.detect_silences(job.audio_path, noise_db=segmenter.LOOSE_NOISE_DB,
-                                             min_len=segmenter.LOOSE_MIN_PAUSE)
-            loose = True
-            result = segmenter.split_sentences(words, durations_ext, silences, dur, texts_in_order, embedder,
-                                               min_pause=segmenter.LOOSE_MIN_PAUSE, **split_args)
+            plan, result = segment(self._order)
+            why = None if not alt or result.correlation >= segmenter.WARN_CORRELATION else \
+                f"độ khớp thấp {result.correlation:.2f}"
+        except segmenter.SegmentError as e:
+            if not alt or isinstance(e, segmenter.TooFewPausesError):
+                raise
+            plan, result, why, first_error = None, None, str(e), e
+        if why:
+            log.info("[%s] Tach cau theo thu tu doc file giong goc: %s -> thu phuong an B (file khac theo timeline)",
+                     job.name, why)
+            try:
+                alt_plan, alt_result = segment(alt)
+            except segmenter.SegmentError as e2:
+                log.info("[%s] Phuong an B loi: %s", job.name, e2)
+                if result is None:
+                    raise first_error
+                alt_result = None
+            if alt_result is not None and (result is None or
+                                           alt_result.correlation > result.correlation + ALT_ORDER_MIN_GAIN):
+                moved = sum(1 for a, b in zip(self._order, alt) if a != b)
+                self.log.emit(f"[{job.name}] Thứ tự đọc theo file giọng gốc không khớp ({why}) → dùng thứ tự: file đọc "
+                              f"đầu + các phần nối tiếp theo file, file khác (bổ sung / lỗi voice) theo vị trí trên "
+                              f"timeline ({moved} câu đổi chỗ, độ khớp {alt_result.correlation:.2f}).")
+                plan, result = alt_plan, alt_result
+            else:
+                log.info("[%s] Phuong an B khong tot hon (do khop %s) -> giu thu tu doc theo file", job.name,
+                         f"{alt_result.correlation:.3f}" if alt_result is not None else "loi")
+        silences, loose = state["silences"], state["loose"]
         self._set_progress(job, share)
         # Cau thu k (thu tu doc) thuoc ve clip self._order[k] -> xep lai theo timeline
         by_clip = [None] * len(clips)
@@ -627,14 +672,15 @@ class RunWorker(QThread):
                                   "warn" if warned else "ok")
         self.log.emit(f"[{job.name}] Xuất {out_path} ({how})")
 
-    def _reading_plan(self, clips, source_texts) -> list:
+    def _reading_plan(self, clips, source_texts, order=None) -> list:
         """Thu tu doc co chen cau MA: [("c", chi so clip) | ("g", ExtraSpeech)]. Cau ma = doan "thua" nam giua 2 clip
-        lien nhau theo thu tu doc (can noi dung cau goc de so nghia)."""
+        lien nhau theo thu tu doc (can noi dung cau goc de so nghia). order: mac dinh self._order."""
+        order = self._order if order is None else order
         extras = [e for e in self._extras if e.kind == "thua"] if source_texts else []
         plan = []
-        for k, i in enumerate(self._order):
+        for k, i in enumerate(order):
             plan.append(("c", i))
-            nxt = self._order[k + 1] if k + 1 < len(self._order) else None
+            nxt = order[k + 1] if k + 1 < len(order) else None
             plan += [("g", e) for e in extras if e.after == i and e.before == nxt]
         return plan
 
