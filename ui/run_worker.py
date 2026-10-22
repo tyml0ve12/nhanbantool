@@ -331,7 +331,7 @@ class RunWorker(QThread):
                 reread = [x for x in group if x.reread_sim >= pipeline.EXTRA_REREAD_SIM]
                 many = f", {len(group)} câu" if len(group) > 1 else ""
                 self.log.emit(f"Giọng gốc có đoạn không thuộc clip nào (câu gốc đã xóa khỏi timeline?): {span}{many} "
-                              f"'{e.text[:80]}' → giọng mới đọc đoạn này sẽ bị bỏ khỏi track chính (track phụ tắt tiếng)"
+                              f"'{e.text[:80]}' → giọng mới đọc đoạn này sẽ bị XÓA"
                               + (f", trừ {len(reread)} câu giống câu đã có (đọc lại → giữ)." if reread else "."))
             elif e.kind == "manh":
                 self.log.emit(f"Cảnh báo: giọng gốc {where} có đoạn ngắn không thuộc clip nào ('{e.text[:60]}') "
@@ -733,9 +733,8 @@ class RunWorker(QThread):
         return gaps
 
     def _place_extras(self, job, ghosts, clips, by_clip, spans, onsets, timeline_end, placements, place_dbg):
-        """Cau THUA giong moi doc (cau ma da nhan doan) -> XOA khoi track chinh, khong co trong mp4 (T-017, chot
-        2026-10-21): track phu "<ten> – câu thừa" TAT TIENG, ngay sau cau truoc (cau cua clip e.after) de nguoi dung
-        nghe kiem tra. Rieng cau ma giong 1 clip >= EXTRA_REREAD_SIM (doc lai, trong doan ho nhieu cau - T-017b): GIU
+        """Cau THUA giong moi doc (cau ma da nhan doan) -> XOA HAN (hotfix 2026-10-22: khong con track phu "câu thừa").
+        Truoc (T-017): track phu tat tieng de nguoi dung nghe kiem tra. Rieng cau ma giong 1 clip >= EXTRA_REREAD_SIM (doc lai, trong doan ho nhieu cau - T-017b): GIU
         nhu v1.2.6 - du cho (tu het loi cau truoc toi luc noi cau sau >= loi cau + EXTRA_ROOM_SEC) -> track chinh, khong
         du -> track phu. Cac cau khac khong doi. Tra ve (placements track chinh, place_dbg, track phu, canh bao)."""
         aux, main, dropped, kept = [], [], {}, []    # main: [(ExtraSpeech, cau, luc noi)]; dropped: {khuc: [(e, cau)]}
@@ -757,9 +756,7 @@ class RunWorker(QThread):
                 prev_end = max((d["core_us"][1] for d in place_dbg if d["core_us"][0] <= end_ref), default=0)
             speech_tl = prev_end + lead
             if e.reread_sim < pipeline.EXTRA_REREAD_SIM:
-                pl, _ = pipeline.compute_placements([sent], [pipeline.OriginalClip(speech_tl, core_len, "", 0, 0)],
-                                                    max(timeline_end, speech_tl + core_len), spans, None, [])
-                aux += pl
+                # Hotfix v1.2.10 (nguoi dung 22/10): doan thua XOA HAN, khong dat track phu
                 dropped.setdefault((e.group, run.get(e.group, 0)), []).append((e, sent))
                 log.info("[%s] CHI TIET | cau thua BO: goc %s %.2f-%.2fs '%s' | moi %.3f-%.3fs '%s' giong %.3f | doc_lai %.3f"
                          " | track phu timeline %.3fs", job.name, os.path.basename(e.path), e.start, e.end, e.text,
@@ -778,15 +775,11 @@ class RunWorker(QThread):
                 if not moved:
                     main, placements, place_dbg = trial, new_pl, new_dbg
             if fits and main and main[-1][0] is e:
-                where = f"đặt trên track chính sau câu {e.after + 1} (timeline {speech_tl / US:.1f}s)"
+                where = f"KHÔNG bỏ, đặt trên track chính sau câu {e.after + 1} (timeline {speech_tl / US:.1f}s)"
             else:
-                pl, _ = pipeline.compute_placements([sent], [pipeline.OriginalClip(speech_tl, core_len, "", 0, 0)],
-                                                    max(timeline_end, speech_tl + core_len), spans, None, [])
-                aux += pl
-                where = (f"không đủ chỗ → track phụ '{draft_patch.extra_track_name(job.name)}' (tắt tiếng), "
-                         f"timeline {speech_tl / US:.1f}s")
+                where = f"không đủ chỗ trên track chính → ĐÃ XÓA (nên nghe lại chỗ timeline {speech_tl / US:.1f}s)"
             kept.append(f"Voice {job.name} đọc câu '{sent.text[:80]}' — đoạn gốc {os.path.basename(e.path)} "
-                        f"{e.start:.1f}–{e.end:.1f}s giống 1 clip ({e.reread_sim:.2f}): có thể là đọc lại → KHÔNG bỏ, {where}.")
+                        f"{e.start:.1f}–{e.end:.1f}s giống 1 clip ({e.reread_sim:.2f}): có thể là đọc lại → {where}.")
             log.info("[%s] CHI TIET | cau thua GIU (doc lai %.3f): goc %s %.2f-%.2fs | moi %.3f-%.3fs '%s' -> %s", job.name,
                      e.reread_sim, os.path.basename(e.path), e.start, e.end, sent.start, sent.end, sent.text, where)
         notes = []
@@ -797,8 +790,7 @@ class RunWorker(QThread):
             where = (f"{os.path.basename(e0.path)} {e0.start:.1f}–{e1.end:.1f}s" if e1.path == e0.path else
                      f"{os.path.basename(e0.path)} {e0.start:.1f}s → {os.path.basename(e1.path)} {e1.end:.1f}s")
             notes.append(f"Đã bỏ đoạn thừa {s0.start:.1f}–{s1.end:.1f}s: '{text[:80]}{'…' if len(text) > 80 else ''}'"
-                         f" — giọng gốc đã xóa (gốc {where}) → track phụ '{draft_patch.extra_track_name(job.name)}'"
-                         " (tắt tiếng) để kiểm tra."
+                         f" — giọng gốc đã xóa (gốc {where}) → ĐÃ XÓA khỏi voice nhân bản."
                          + (f" Đoạn gốc giống 1 clip ({reread:.2f}) — có thể là đọc lại, nên nghe."
                             if reread >= pipeline.EXTRA_REREAD_WARN else ""))
         return placements, place_dbg, pipeline.stack_placements(aux), notes + kept
