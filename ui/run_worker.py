@@ -398,11 +398,12 @@ class RunWorker(QThread):
 
         def segment(order):
             plan = self._reading_plan(clips, source_texts, order)
-            durations_ext = [clips[x].target_duration_us / US if kind == "c" else x.end - x.start for kind, x in plan]
+            durations_ext = [clips[x].target_duration_us / US if kind == "c" else x.duration for kind, x in plan]
             texts_in_order = [source_texts[x] if kind == "c" else x.text for kind, x in plan] if source_texts else None
             split_args = dict(labels=[x + 1 if kind == "c" else f"thừa sau {x.after + 1}" for kind, x in plan],
                               pair_gaps=self._plan_gaps(clips, plan),
                               ghosts={k for k, (kind, _) in enumerate(plan) if kind == "g"},
+                              blocks={k for k, (kind, x) in enumerate(plan) if kind == "g" and x.pieces},
                               optional={k for k, (kind, x) in enumerate(plan) if kind == "c" and x in self._optional})
             try:
                 result = segmenter.split_sentences(words, durations_ext, state["silences"], dur, texts_in_order,
@@ -676,14 +677,15 @@ class RunWorker(QThread):
 
     def _reading_plan(self, clips, source_texts, order=None) -> list:
         """Thu tu doc co chen cau MA: [("c", chi so clip) | ("g", ExtraSpeech)]. Cau ma = doan "thua" nam giua 2 clip
-        lien nhau theo thu tu doc (can noi dung cau goc de so nghia). order: mac dinh self._order."""
+        lien nhau theo thu tu doc (can noi dung cau goc de so nghia). order: mac dinh self._order. Cau ma lien nhau cua 1
+        doan ho -> 1 KHOI (pipeline.ghost_blocks, T-029 c)."""
         order = self._order if order is None else order
         extras = [e for e in self._extras if e.kind == "thua"] if source_texts else []
         plan = []
         for k, i in enumerate(order):
             plan.append(("c", i))
             nxt = order[k + 1] if k + 1 < len(order) else None
-            plan += [("g", e) for e in extras if e.after == i and e.before == nxt]
+            plan += [("g", e) for e in pipeline.ghost_blocks([e for e in extras if e.after == i and e.before == nxt])]
         return plan
 
     @staticmethod
@@ -787,6 +789,7 @@ class RunWorker(QThread):
         notes = []
         for items in dropped.values():
             (e0, s0), (e1, s1) = items[0], items[-1]
+            e0, e1 = (e0.pieces or [e0])[0], (e1.pieces or [e1])[-1]     # khoi cau ma vat qua 2 phan: dau / cuoi that
             text = " ".join(s.text for _, s in items)
             reread = max(e.reread_sim for e, _ in items)
             where = (f"{os.path.basename(e0.path)} {e0.start:.1f}–{e1.end:.1f}s" if e1.path == e0.path else

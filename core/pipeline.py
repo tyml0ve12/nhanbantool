@@ -185,6 +185,38 @@ class ExtraSpeech:
     reread_len: float = 0.0   # ti le do dai chu voi clip do
     reread_clip: int = -1     # clip do (-1: khong clip nao MiniLM >= EXTRA_REREAD_SIM)
     no_end: bool = False      # doan ho KHONG ket bang dau ket cau nhung du dieu kien cau ma (_tail_is_ghost, T-029)
+    pieces: list = None       # KHOI cau ma (ghost_blocks): cac cau ma lien nhau ben trong
+
+    @property
+    def duration(self) -> float:
+        """Do dai trong giong goc (khoi vat qua 2 phan: tong tung cau)."""
+        return sum(p.end - p.start for p in self.pieces) if self.pieces else self.end - self.start
+
+
+def ghost_blocks(ghosts: list) -> list:
+    """Cac cau ma LIEN NHAU cua 1 doan ho (theo thu tu) -> 1 KHOI (T-029 c): giong moi tach cau 1 lan cho ca khoi, xoa ca
+    khoi (dich gop / tach cau khac giong goc khong con lam sot). Cau DOC LAI (reread) la ranh gioi - dung rieng."""
+    out, run = [], []
+
+    def flush():
+        if len(run) == 1:
+            out.append(run[0])
+        elif run:
+            a, b = run[0], run[-1]
+            out.append(ExtraSpeech(a.path, a.start, b.end, sum(p.speech for p in run), " ".join(p.text for p in run),
+                                   a.after, a.before, "thua", max(p.reread_sim for p in run), a.group,
+                                   no_end=any(p.no_end for p in run), pieces=list(run)))
+        run.clear()
+
+    for e in ghosts:
+        if run and (e.reread or e.group != run[-1].group):
+            flush()
+        if e.reread:
+            out.append(e)
+        else:
+            run.append(e)
+    flush()
+    return out
 
 
 def find_extra_speech(clips: list, source_map: dict, words_by_file: dict, levels_by_file: dict,

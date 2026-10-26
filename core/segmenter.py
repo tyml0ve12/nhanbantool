@@ -67,6 +67,10 @@ MAX_MISSING = 5               # thieu > 5 cau -> bao loi ngon ngu do, khong xep 
 # moi co the doc thua. Tuy chon: duoc bo qua (buoc 0, khong tinh la thieu), khong gop 2:1 voi cau ben canh, chi nhan
 # doan giong moi khi do giong >= GHOST_MIN_SIM (chan ca thieu + thua triet nhau).
 GHOST_MIN_SIM = 0.5
+# KHOI cau ma (T-029 c): cac cau ma lien nhau cua 1 doan ho tach 1 lan nhu 1 cau (dich gop / doi cho ngat cau khac giong
+# goc -> tung cau ma rieng le khong nhan dung doan -> sot). Khoi dai nen duoc phu toi BLOCK_MAX_UNITS cho ngat (cau that
+# van MAX_UNITS); khoi van tuy chon (bo qua duoc, chi nhan doan giong >= GHOST_MIN_SIM).
+BLOCK_MAX_UNITS = 3 * MAX_UNITS
 # Cau TUY CHON cua file phu chen ngan (loi keu goi, pipeline.short_insert_clips): nguong cao hon - loi keu goi KHAC
 # noi dung trong giong moi (vd "suscribete..." cuoi voice Tay 120) giong 0.45-0.49, ban dich dung 0.78-0.88, dien dat
 # ngan gon khac di 0.66 (do 2026-10-21, COO chot 0.58).
@@ -169,13 +173,14 @@ def _candidates(words, silences, t0, t1, min_pause=MIN_PAUSE):
 
 def split_sentences(words, original_durations, silences, audio_duration,
                     original_texts=None, embedder=None, on_log=None, labels=None,
-                    pair_gaps=None, min_pause=MIN_PAUSE, ghosts=None, optional=None) -> SegmentResult:
+                    pair_gaps=None, min_pause=MIN_PAUSE, ghosts=None, optional=None, blocks=None) -> SegmentResult:
     """labels: so thu tu hien thi cua tung cau trong canh bao (vd so thu tu tren
     timeline khi cau duoc can theo thu tu doc). Mac dinh 1..N.
     pair_gaps[k]: khoang cach tren timeline (giay) giua cau goc k va k+1 (thu tu doc)
     - dung de phat viec gop 2 cau cach xa nhau.
     ghosts: chi so (thu tu doc) cac cau MA - xem GHOST_MIN_SIM. sentences[g] = None neu giong moi khong doc.
-    optional: cau TUY CHON (file phu chen ngan) - nhu cau ma, nguong OPTIONAL_MIN_SIM."""
+    optional: cau TUY CHON (file phu chen ngan) - nhu cau ma, nguong OPTIONAL_MIN_SIM.
+    blocks: cau ma la KHOI nhieu cau (pipeline.ghost_blocks) - duoc phu toi BLOCK_MAX_UNITS cho ngat (xem BLOCK_MAX_UNITS)."""
     ghosts = {g: GHOST_MIN_SIM for g in ghosts or ()} | {o: OPTIONAL_MIN_SIM for o in optional or ()}   # {k: do giong toi thieu}
     n = len(original_durations)
     labels = labels or list(range(1, n + 1))
@@ -206,9 +211,18 @@ def split_sentences(words, original_durations, silences, audio_duration,
 
     # Bo cac doan dai bat hop ly (dai hon 1.8 lan cau goc dai nhat) - giam
     # manh so doan phai so nghia.
-    max_len = 1.8 * ratio * max(original_durations)
+    blocks = frozenset(blocks or ()) & set(ghosts)
+    max_len = 1.8 * ratio * max([d for k, d in enumerate(original_durations) if k not in blocks] or original_durations)
     spans = [(a, b) for a in range(last_node) for b in range(a + 1, min(last_node, a + MAX_UNITS) + 1)
              if node_end[b] - node_start[a] <= max_len]
+    block_spans = frozenset()           # doan CHI khoi cau ma duoc dung (dai hon MAX_UNITS / max_len)
+    if blocks:
+        block_len = 1.8 * ratio * max(original_durations[k] for k in blocks)
+        normal = set(spans)
+        block_spans = frozenset((a, b) for a in range(last_node) for b in range(a + 1, min(last_node, a + BLOCK_MAX_UNITS) + 1)
+                                if node_end[b] - node_start[a] <= block_len and (a, b) not in normal)
+        spans += sorted(block_spans)
+    blk = (blocks, block_spans)
     sim = sim2 = None
     skip, unsure, local = {g: SKIP_PENALTY for g in ghosts}, [], []   # duoc bo qua {k: phi}; nghi thieu [(nhan, giong)]
     candidates = []                     # ung vien thieu [(k, giong cuc bo, giong thap nhat cau ben canh)] - ghi log
@@ -238,9 +252,10 @@ def split_sentences(words, original_durations, silences, audio_duration,
         sim = {span: coarse[k] for k, span in enumerate(spans)}
         sim2 = {span: coarse2[k] for k, span in enumerate(spans)} if coarse2 is not None else None
         steps = _align_iter(n, node_start, node_end, node_score, original_durations, ratio, sim, sim2, orig_total,
-                            merge_cost, skip, ghosts)
+                            merge_cost, skip, ghosts, blk)
         if steps is not None:
-            local = _local_best(n, steps, sim, node_start, node_end, original_durations, ratio)
+            local = _local_best(n, steps, {sp: v for sp, v in sim.items() if sp not in block_spans}, node_start,
+                                node_end, original_durations, ratio)
             real = [k for k in range(n) if k not in ghosts]
             found = False
             for j, k in enumerate(real):
@@ -259,7 +274,7 @@ def split_sentences(words, original_durations, silences, audio_duration,
                         unsure.append((labels[k], local[k]))
             if found:
                 with_skip = _align_iter(n, node_start, node_end, node_score, original_durations, ratio, sim, sim2,
-                                        orig_total, merge_cost, skip, ghosts)
+                                        orig_total, merge_cost, skip, ghosts, blk)
                 if with_skip is not None:
                     steps = with_skip
 
@@ -283,12 +298,12 @@ def split_sentences(words, original_durations, silences, audio_duration,
             fine = {span: exact[k] for k, span in enumerate(near)}
             fine2 = {span: exact2[k] for k, span in enumerate(near)} if exact2 is not None else None
             refined = _align_iter(n, node_start, node_end, node_score, original_durations, ratio,
-                                  fine, fine2, orig_total, merge_cost, skip, ghosts)
+                                  fine, fine2, orig_total, merge_cost, skip, ghosts, blk)
             if refined is not None:
                 steps, sim, sim2 = refined, fine, fine2
     else:
         steps = _align_iter(n, node_start, node_end, node_score, original_durations, ratio, None, None, orig_total,
-                            merge_cost, skip, ghosts)
+                            merge_cost, skip, ghosts, blk)
     if steps is None:
         raise SegmentError("Không căn được câu mới với câu gốc (độ dài quá chênh lệch). "
                            "Kiểm tra audio có đúng kịch bản của project này không.")
@@ -393,11 +408,12 @@ def split_sentences(words, original_durations, silences, audio_duration,
 
 
 def _align_iter(n, node_start, node_end, node_score, original_durations, ratio, sim, sim2, orig_total, merge_cost,
-                skip=None, ghosts=frozenset()):
+                skip=None, ghosts=frozenset(), blk=(frozenset(), frozenset())):
     """Chay DP 2 lan: lan 2 dung ti le toc do tinh lai tu ket qua lan 1 (khong tinh cau bi bo qua)."""
     steps = None
     for _ in range(2):
-        steps = _align(n, node_start, node_end, node_score, original_durations, ratio, sim, sim2, merge_cost, skip, ghosts)
+        steps = _align(n, node_start, node_end, node_score, original_durations, ratio, sim, sim2, merge_cost, skip, ghosts,
+                       blk)
         if steps is None:
             return None
         ratio = _step_ratio(steps, node_start, node_end, original_durations)
@@ -431,15 +447,17 @@ def _local_best(n, steps, sim, node_start, node_end, original_durations, ratio) 
 
 
 def _align(n, node_start, node_end, node_score, original_durations, ratio, sim, sim2, merge_cost, skip=None,
-           ghosts=frozenset()):
+           ghosts=frozenset(), blk=(frozenset(), frozenset())):
     """Quy hoach dong. Moi buoc = 1 doan audio moi (node a -> node b) phu:
       - 1 cau goc (binh thuong), hoac
       - 2 cau goc LIEN NHAU (can 2:1, chi khi co so nghia): ban dich doc lien 2 cau, hoac
       - 0 audio (buoc 0, a = b): bo qua cau goc k giong moi thieu - chi cac cau trong skip {k: phi}.
     Cau ma (ghosts {k: do giong toi thieu}): khong gop 2:1, chi nhan doan co do giong >= nguong cua cau do.
+    blk = (khoi cau ma, doan chi khoi dung): khoi phu toi BLOCK_MAX_UNITS cho ngat; cau khac khong dung doan cua khoi.
     Tra ve [(a, b, cau_goc_dau, so_cau_goc)] hoac None."""
     last_node = len(node_start) - 1
     INF = float("inf")
+    blocks, block_spans = blk
     costs = [{0: (0.0, None, 0)}]          # costs[i][node] = (chi phi, node truoc, so cau goc cua buoc)
     for i in range(1, n + 1):
         cur = {}
@@ -457,9 +475,9 @@ def _align(n, node_start, node_end, node_score, original_durations, ratio, sim, 
             table = sim if step == 1 else sim2
             for b in targets:
                 best = cur.get(b, (INF,))[0]
-                for a in range(max(0, b - MAX_UNITS), b):
+                for a in range(max(0, b - (BLOCK_MAX_UNITS if k in blocks else MAX_UNITS)), b):
                     pa = prev.get(a)
-                    if pa is None:
+                    if pa is None or (k not in blocks and (a, b) in block_spans):
                         continue
                     length = node_end[b] - node_start[a]
                     if length <= 0.2:
