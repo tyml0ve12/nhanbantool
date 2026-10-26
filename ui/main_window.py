@@ -420,7 +420,7 @@ class MainWindow(QMainWindow):
         summary = (f"CapCut {info.app_version} · dài {format_us(info.duration_us)} · "
                    f"{main.segment_count} câu thoại · sẽ cập nhật {len(info.draft_files)} file draft")
         status = capcut_status(info.drafts_dir)
-        self.project_registered = status != "outside"
+        self.project_registered = status in ("index", "root")
         if status == "index":
             self.project_info.setObjectName("projectInfo")
             self.project_info.setText(summary)
@@ -428,6 +428,11 @@ class MainWindow(QMainWindow):
             self.project_info.setObjectName("projectInfo")
             self.project_info.setText(f"{summary}\n{NOT_OPENED_NOTE}")
             self._log(NOT_OPENED_NOTE)
+        elif status == "removed":
+            self.project_info.setObjectName("projectError")
+            self.project_info.setText(
+                summary + "\n⚠ Project này đã bị XÓA trong CapCut (thư mục còn lại) — CapCut sẽ không thấy "
+                "thay đổi. Chọn lại ở ô 'Project CapCut'.")
         else:
             self.project_info.setObjectName("projectError")
             self.project_info.setText(

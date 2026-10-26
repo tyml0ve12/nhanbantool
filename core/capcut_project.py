@@ -6,9 +6,11 @@ CapCut 6.x luu 2 ban draft_content.json giong het nhau:
   <File Drafts>/Timelines/<main_timeline_id>/draft_content.json
 -> khi ap dung ket qua phai thay CA 2.
 """
+import ctypes
 import json
 import os
 import subprocess
+import time
 from dataclasses import dataclass, field
 
 from core.paths import is_network_path
@@ -161,6 +163,11 @@ class CapCutProject:
 # cha cac project nguoi dung da chon / da chay (app nho, toi da REMEMBERED_ROOTS_MAX). Khong quet o dia / doan thu muc khac.
 REMEMBERED_ROOTS_MAX = 10
 SKIP_DIR_SUFFIXES = (".7z", ".rar", ".zip", ".tmp", ".bak")
+# Moi thu muc goc quet toi da SCAN_MAX_ENTRIES muc / SCAN_MAX_SEC giay (khong treo giao dien). Thu muc app nho nam tren
+# Google Drive (o ao "Google Drive" / duong dan shortcut) -> khong quet (liet ke cham, co the tai file ve).
+SCAN_MAX_ENTRIES = 2000
+SCAN_MAX_SEC = 1.0
+CLOUD_MARKERS = (".shortcut-targets-by-id", "my drive", "drive của tôi", "shared drives", "bộ nhớ dùng chung")
 
 
 def capcut_index_path() -> str:
@@ -211,6 +218,22 @@ def capcut_roots() -> list:
     return list(roots.values())
 
 
+def _on_google_drive(path: str) -> bool:
+    """Thu muc nam tren Google Drive for desktop: duong dan co dau hieu Drive, hoac o dia ten "Google Drive"."""
+    low = os.path.normpath(path).lower()
+    if any(m in low for m in CLOUD_MARKERS):
+        return True
+    drive = os.path.splitdrive(os.path.abspath(path))[0]
+    if os.name != "nt" or not drive or drive.startswith("\\\\"):
+        return False
+    name = ctypes.create_unicode_buffer(261)
+    try:
+        ok = ctypes.windll.kernel32.GetVolumeInformationW(drive + "\\", name, 261, None, None, None, None, 0)
+    except (AttributeError, OSError):
+        return False
+    return bool(ok) and "google drive" in name.value.lower()
+
+
 def remember_root(remembered: list, drafts_dir: str) -> list:
     """Them thu muc cha cua project vao danh sach thu muc da nho (moi nhat dau, toi da REMEMBERED_ROOTS_MAX)."""
     parent = os.path.dirname(os.path.normpath(drafts_dir))
@@ -232,13 +255,16 @@ def list_capcut_projects(remembered=()) -> list:
     cc = {_key(r) for r in capcut_roots()}
     roots = {_key(r): r for r in capcut_roots() + [r for r in remembered or () if r]}
     for rk, root in roots.items():
-        if is_network_path(root):
+        if is_network_path(root) or (rk not in cc and _on_google_drive(root)):
             continue
         try:
-            names = os.listdir(root)
+            names = os.listdir(root)[:SCAN_MAX_ENTRIES]
         except OSError:
             continue
+        deadline = time.monotonic() + SCAN_MAX_SEC
         for name in names:
+            if time.monotonic() > deadline:
+                break
             folder = os.path.join(root, name)
             if name.startswith((".", "~")) or name.lower().endswith(SKIP_DIR_SUFFIXES) or _key(folder) in known:
                 continue
@@ -255,19 +281,25 @@ def list_capcut_projects(remembered=()) -> list:
 
 def capcut_status(drafts_dir: str) -> str:
     """"index": project CapCut dang quan ly; "root": nam trong thu muc goc cua CapCut nhung chua mo (CapCut tu nhan khi
-    mo - T-031, khong chan chay); "outside": ngoai cac thu muc do -> CapCut se khong doc thay doi ghi vao day (loi that
-    da gap: sua nham ban copy)."""
+    mo - T-031, khong chan chay); "removed": da XOA trong CapCut (thu muc con) -> CapCut khong hien, canh bao nhu
+    "outside"; "outside": ngoai cac thu muc do -> CapCut se khong doc thay doi ghi vao day (loi that da gap: sua nham ban
+    copy)."""
     target = _key(drafts_dir)
+    removed = False
     for item, folder in _capcut_index():
-        if _key(folder) == target and not item.get("tm_draft_removed"):
-            return "index"
+        if _key(folder) == target:
+            if not item.get("tm_draft_removed"):
+                return "index"
+            removed = True
+    if removed:
+        return "removed"
     parent = _key(os.path.dirname(os.path.normpath(drafts_dir)))
     return "root" if any(_key(r) == parent for r in capcut_roots()) else "outside"
 
 
 def is_registered_in_capcut(drafts_dir: str) -> bool:
     """Project CapCut se thay thay doi (dang quan ly, hoac trong thu muc goc CapCut tu nhan - T-031)."""
-    return capcut_status(drafts_dir) != "outside"
+    return capcut_status(drafts_dir) in ("index", "root")
 
 
 def is_capcut_running() -> bool:
