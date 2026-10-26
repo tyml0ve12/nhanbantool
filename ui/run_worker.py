@@ -320,10 +320,10 @@ class RunWorker(QThread):
                 groups.setdefault(e.group, []).append(e)
         for e in self._extras:
             log.info("DOAN HO giong goc [%s] %s %.2f-%.2fs tieng %.2fs sau cau %d truoc cau %d giong clip %.2f: '%s'"
-                     " | nhom %d (%d cau) | doc lai %s (clip %d: chu %.2f, do dai %.2f)", e.kind,
+                     " | nhom %d (%d cau) | doc lai %s (clip %d: chu %.2f, do dai %.2f)%s", e.kind,
                      os.path.basename(e.path), e.start, e.end, e.speech, e.after + 1, e.before + 1, e.reread_sim, e.text,
                      e.group, len(groups.get(e.group, [])), "CO" if e.reread else "khong", e.reread_clip + 1,
-                     e.reread_text, e.reread_len)
+                     e.reread_text, e.reread_len, " | khong dau ket cau (T-029a)" if e.no_end else "")
             where = f"{os.path.basename(e.path)} {e.start:.1f}–{e.end:.1f}s"
             group = groups.get(e.group, [])
             if e.kind == "thua" and e is group[0]:      # doan ho (1 hay nhieu cau, co the vat qua 2 phan): bao 1 dong

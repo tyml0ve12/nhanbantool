@@ -153,6 +153,14 @@ EXTRA_REREAD_WARN = 0.55      # cau thua giong 1 clip tu muc nay (duoi EXTRA_RER
 EXTRA_REREAD_TEXT = 0.6
 EXTRA_REREAD_LEN = (0.7, 1.4)
 EXTRA_SENTENCE_END = re.compile(r"[.!?。！？…]+[\"'”’»)\]]*$")
+# Doan ho KHONG ket bang dau ket cau (T-029, bai 195: whisper ket "del Congo," -> xep "manh" -> khong xoa -> sot) van la
+# cau ma khi DU ca: giua 2 clip; cau / clip TRUOC no ket cau; >= EXTRA_LOOSE_SPEECH_SEC co tieng va >= EXTRA_LOOSE_WORDS chu; co
+# lang >= EXTRA_LOOSE_QUIET_SEC voi clip SAU, hoac clip sau bat dau chu hoa (chu khong co hoa/thuong: clip sau tu ket
+# cau); giong nghia clip ke ben < EXTRA_REREAD_WARN. Khong du -> "manh" nhu cu (cat lem giua cau).
+EXTRA_LOOSE_SPEECH_SEC = 1.5
+EXTRA_LOOSE_WORDS = 5
+EXTRA_LOOSE_QUIET_SEC = 0.3
+EXTRA_STRADDLE_SEC = 0.05     # chu vat qua mep clip moi ben > muc nay -> thuoc clip, khong tinh vao doan ho (T-029)
 # Giong moi doc cau thua -> XOA het (T-017, nguoi dung chot 2026-10-21 "thua thi xoa het cho khop voice goc"): khong dat track
 # chinh, khong co trong mp4 -> track phu tat tieng + canh bao. Doan ho nhieu cau -> chia thanh nhieu cau ma theo dau ket
 # cau (1 cau ma phai nam trong MAX_UNITS cho ngat cua DP tach cau). Doan giong 1 clip >= EXTRA_REREAD_SIM la "doc lai",
@@ -176,16 +184,17 @@ class ExtraSpeech:
     reread_text: float = 0.0  # giong chu voi clip MiniLM >= EXTRA_REREAD_SIM khop nhat (ghi log)
     reread_len: float = 0.0   # ti le do dai chu voi clip do
     reread_clip: int = -1     # clip do (-1: khong clip nao MiniLM >= EXTRA_REREAD_SIM)
+    no_end: bool = False      # doan ho KHONG ket bang dau ket cau nhung du dieu kien cau ma (_tail_is_ghost, T-029)
 
 
 def find_extra_speech(clips: list, source_map: dict, words_by_file: dict, levels_by_file: dict,
                       clip_texts: list, embed=None, frame_sec: float = 0.01) -> list:
     """Tim doan co tieng trong file giong goc khong thuoc clip nao (moi file: truoc clip dau, giua 2 clip lien nhau
     theo vi tri trong file, sau clip cuoi). Phan loai:
-      thua      - giua 2 clip, >= EXTRA_MIN_SPEECH_SEC co tieng, >= EXTRA_MIN_WORDS chu, ket bang dau ket cau,
-                  khong giong noi dung clip nao (cau goc da xoa khoi timeline -> giong moi co the doc thua);
+      thua      - giua 2 clip, chia theo dau ket cau (_gap_parts, T-029): cac cau day du + phan cuoi du dieu kien
+                  (cau goc da xoa khoi timeline -> giong moi co the doc thua);
       doc lai   - CUNG CAU voi 1 clip (_reread_of; ke ca clip file khac: file loi voice / bo sung) -> bo qua;
-      manh      - co tieng nhung ngan / it chu / khong ket cau (cat lem) -> chi canh bao;
+      manh      - co tieng nhung ngan / it chu / khong ket cau (cat lem), duoi cau do cua clip truoc -> chi canh bao;
       dau file / cuoi file - truoc clip dau / sau clip cuoi cua file -> chi canh bao.
     Giong goc chia nhieu PHAN danh so lien nhau (44.5 -> 44.6): cuoi phan k + dau phan k+1 = 1 doan ho BEN TRONG
     (T-017b: doan bi xoa vat qua ranh gioi 2 phan). Doan ho nhieu cau: moi cau 1 cau ma; cau giong 1 clip >= EXTRA_REREAD_SIM
@@ -216,7 +225,9 @@ def find_extra_speech(clips: list, source_map: dict, words_by_file: dict, levels
             if gap_end - gap_start < EXTRA_MIN_GAP_SEC:
                 continue
             speech = _speech_sec(levels, threshold, gap_start, gap_end, frame_sec)
-            ws = [w for w in words_by_file[path] if w.text.strip() and gap_start <= (w.start + w.end) / 2 < gap_end]
+            # chu VAT QUA mep clip (clip cat giua chu - bai 176 "El", 195) thuoc clip ben canh, khong tinh vao doan ho
+            ws = [w for w in words_by_file[path] if w.text.strip() and gap_start <= (w.start + w.end) / 2 < gap_end
+                  and not _straddles(w, gap_start) and not _straddles(w, gap_end)]
             if speech < 0.3:      # chi chu whisper (moc chu som / lech) ma khong co tieng -> khong phai doan noi
                 continue
             gaps.append([after, before, [(path, gap_start, gap_end, ws, speech)]])
@@ -237,31 +248,37 @@ def find_extra_speech(clips: list, source_map: dict, words_by_file: dict, levels
             continue
         merged = [last_a, first_b, (tail[2] if tail else []) + (head[2] if head else [])]
         gaps = [g for g in gaps if g is not tail and g is not head] + [merged]
-    out, clip_vec, group = [], None, 0
+    out, group = [], 0
+    clip_vec = []                                   # [vector noi dung clip] - tinh 1 lan khi can
+
+    def clip_sims(t):
+        if not clip_vec:
+            clip_vec.append(embed([x or "" for x in clip_texts]))
+        return clip_vec[0] @ embed([t])[0] if len(clip_vec[0]) else np.zeros(0)
+
     for after, before, segs in gaps:
-        ws = [w for s in segs for w in s[3]]
-        text = "".join(w.text for w in ws).strip()
-        speech = sum(s[4] for s in segs)
-        if after < 0 or before < 0 or speech < EXTRA_MIN_SPEECH_SEC or len(ws) < EXTRA_MIN_WORDS \
-                or not EXTRA_SENTENCE_END.search(text):
+        parts = [] if after < 0 or before < 0 else \
+            _gap_parts(after, before, segs, clip_texts, info, frame_sec, clip_sims if embed is not None else None)
+        if not any(kind == "thua" for kind, _, _ in parts):
             kind = "dau file" if after < 0 else "cuoi file" if before < 0 else "manh"
             out += [ExtraSpeech(p, a, b, sp, "".join(w.text for w in sw).strip(), after, before, kind)
                     for p, a, b, sw, sp in segs]
             continue
         group += 1
         pieces = []
-        for p, a0, b0, sw, sp in segs:
-            split = _split_gap(sw, a0, b0) if sw else []
-            for a, b, pws in split:
-                one = len(split) == 1
-                pieces.append(ExtraSpeech(p, a, b, sp if one else _speech_sec(info[p][0], info[p][1], a, b, frame_sec),
-                                          "".join(w.text for w in pws).strip(), after, before, "thua", group=group))
+        for kind, no_end, regions in parts:
+            for si, a, b, pws in regions:
+                p = segs[si][0]
+                piece = ExtraSpeech(p, a, b, _speech_sec(info[p][0], info[p][1], a, b, frame_sec),
+                                    "".join(w.text for w in pws).strip(), after, before, kind, no_end=no_end)
+                if kind == "thua":
+                    piece.group = group
+                    pieces.append(piece)
+                else:
+                    out.append(piece)      # duoi cau do cua clip truoc / cuoi khong du dieu kien: "manh" nhu cu
         for piece in pieces:
             if embed is not None and piece.text:
-                if clip_vec is None:
-                    clip_vec = embed([t or "" for t in clip_texts])
-                v = embed([piece.text])[0]
-                sims = clip_vec @ v if len(clip_vec) else np.zeros(0)
+                sims = clip_sims(piece.text)
                 piece.reread_sim = float(sims.max()) if len(sims) else 0.0
                 _reread_of(piece, sims, clip_texts)
                 # doan 1 cau doc lai -> bo qua (nhu cu); trong doan nhieu cau: van la cau ma, khong xoa (run_worker)
@@ -270,6 +287,109 @@ def find_extra_speech(clips: list, source_map: dict, words_by_file: dict, levels
         out += pieces
     out.sort(key=lambda e: (files.index(e.path) if e.path in files else len(files), e.start))
     return out
+
+
+def _gap_parts(after, before, segs, clip_texts, info, frame_sec, clip_sims) -> list:
+    """Chia doan ho giua 2 clip theo DAU KET CAU (T-029 a'): [(loai, khong_dau_ket, [(seg, dau, cuoi, chu)])] theo thu tu.
+      - phan DAU toi dau ket cau dau tien khi clip truoc KHONG ket cau = duoi cau clip truoc (bai 176: clip 1 cat giua cau)
+        -> "manh" (khong xoa, canh bao);
+      - cac cau DAY DU (ket bang dau ket cau) -> "thua" (cau ma) neu tong >= EXTRA_MIN_SPEECH_SEC tieng, >= EXTRA_MIN_WORDS
+        chu; cau qua ngan (< EXTRA_MIN_WORDS chu) gop vao cau sau (cau cuoi: vao cau truoc);
+      - phan CUOI khong dau ket cau -> "thua" neu du dieu kien _tail_is_ghost (T-029 a), khong -> "manh".
+    Ranh gioi = giua chu cuoi phan truoc va chu dau phan sau; phan vat qua 2 phan file -> moi file 1 doan."""
+    items = [(si, w) for si, s in enumerate(segs) for w in s[3]]
+    if not items:
+        return []
+    groups, cur = [], []
+    for it in items:
+        cur.append(it)
+        if EXTRA_SENTENCE_END.search(it[1].text.strip()):
+            groups.append(cur)
+            cur = []
+    tail = cur
+    ends = lambda g: bool(g) and bool(EXTRA_SENTENCE_END.search(g[-1][1].text.strip()))   # noqa: E731
+    head = groups.pop(0) if groups and not EXTRA_SENTENCE_END.search((clip_texts[after] or "").strip()) else []
+    full = []
+    for g in groups:
+        if full and len(full[-1]) < EXTRA_MIN_WORDS:
+            full[-1] = full[-1] + g
+        else:
+            full.append(g)
+    if len(full) > 1 and len(full[-1]) < EXTRA_MIN_WORDS:
+        full[-2:] = [full[-2] + full[-1]]
+    ordered = [("manh", False, head)] if head else []
+    regions = lambda g: _regions(segs, items, g)   # noqa: E731
+    speech = lambda g: sum(_speech_sec(info[segs[si][0]][0], info[segs[si][0]][1], a, b, frame_sec)   # noqa: E731
+                           for si, a, b, _ in regions(g))
+    ok_full = sum(len(g) for g in full) >= EXTRA_MIN_WORDS and sum(speech(g) for g in full) >= EXTRA_MIN_SPEECH_SEC
+    ordered += [("thua" if ok_full else "manh", False, g) for g in full]
+    if tail:
+        prev_ends = ends(full[-1]) if full else ends(head) if head else \
+            bool(EXTRA_SENTENCE_END.search((clip_texts[after] or "").strip()))
+        ghost = prev_ends and _tail_is_ghost(after, before, segs, speech(tail), tail, clip_texts, info, frame_sec,
+                                             clip_sims)
+        ordered.append(("thua" if ghost else "manh", ghost, tail))
+    return [(kind, no_end, regions(g)) for kind, no_end, g in ordered]
+
+
+def _straddles(w, t: float) -> bool:
+    """Chu whisper vat qua moc t (moi ben > EXTRA_STRADDLE_SEC)."""
+    return w.start < t - EXTRA_STRADDLE_SEC and w.end > t + EXTRA_STRADDLE_SEC
+
+
+def _regions(segs, items, group) -> list:
+    """Vung trong file cua 1 nhom chu (lien tiep trong items): [(seg, dau, cuoi, chu)]. Bien = giua chu cuoi nhom truoc va
+    chu dau nhom sau (cung file), dau / cuoi doan ho; nhom vat qua 2 file -> 2 vung."""
+    k0, k1 = items.index(group[0]), items.index(group[-1])
+    out = []
+    for si in sorted({si for si, _ in group}):
+        ws = [w for s, w in group if s == si]
+        a, b = segs[si][1], segs[si][2]
+        if si == group[0][0] and k0 > 0 and items[k0 - 1][0] == si:
+            a = (items[k0 - 1][1].end + group[0][1].start) / 2
+        if si == group[-1][0] and k1 + 1 < len(items) and items[k1 + 1][0] == si:
+            b = (group[-1][1].end + items[k1 + 1][1].start) / 2
+        out.append((si, a, b, ws))
+    return out
+
+
+def _tail_is_ghost(after, before, segs, speech, tail, clip_texts, info, frame_sec, clip_sims) -> bool:
+    """Phan cuoi doan ho KHONG ket bang dau ket cau van la cau ma? (xem EXTRA_LOOSE_*; cau truoc no da ket cau).
+    clip_sims(chu) -> giong nghia moi clip; None (khong co model) -> False."""
+    text = "".join(w.text for _, w in tail).strip()
+    n_words = len(tail)
+    if clip_sims is None or not text:
+        return False
+    if speech < EXTRA_LOOSE_SPEECH_SEC or n_words < EXTRA_LOOSE_WORDS:
+        return False
+    nxt = (clip_texts[before] or "").strip()
+    first = next((ch for ch in nxt if ch.isalpha()), "")
+    starts = first.isupper() or (first and not first.islower() and bool(EXTRA_SENTENCE_END.search(nxt)))
+    p, _, b, _, _ = segs[-1]           # ranh gioi voi clip sau (clip co the bat dau sat / lui vao tieng 1 chut)
+    quiet = max(_quiet_around(info[p][0], info[p][1], b + d, frame_sec) for d in (-0.15, -0.1, -0.05, 0, 0.05))
+    if not (starts or quiet >= EXTRA_LOOSE_QUIET_SEC):
+        return False
+    # Khong CUNG CAU voi clip ke ben (cung chu de thi MiniLM van cao - bai 195: 0.71 voi clip truoc, chu chi 0.24)
+    sims, mine = clip_sims(text), _plain(text)
+    for j in (after, before):
+        other = _plain(clip_texts[j])
+        same = difflib.SequenceMatcher(None, mine, other, autojunk=False).ratio() if mine and other else 0.0
+        if j < len(sims) and float(sims[j]) >= EXTRA_REREAD_WARN and same >= EXTRA_REREAD_TEXT:
+            return False
+    return True
+
+
+def _quiet_around(levels, threshold, t: float, frame_sec: float) -> float:
+    """Do dai khoang lang (duoi nguong co tieng) lien tuc chua thoi diem t (giay); 0 neu t dang co tieng."""
+    f = min(len(levels) - 1, max(0, int(round(t / frame_sec))))
+    if levels[f] > threshold:
+        return 0.0
+    lo = hi = f
+    while lo > 0 and levels[lo - 1] <= threshold:
+        lo -= 1
+    while hi + 1 < len(levels) and levels[hi + 1] <= threshold:
+        hi += 1
+    return (hi - lo + 1) * frame_sec
 
 
 def _plain(text: str) -> str:
@@ -310,33 +430,6 @@ def _next_part(a: str, b: str) -> bool:
         return False
     diff = [(x, y) for x, y in zip(ta, tb) if x != y]
     return len(diff) == 1 and diff[0][0].isdigit() and diff[0][1].isdigit() and int(diff[0][1]) == int(diff[0][0]) + 1
-
-
-def _split_gap(words: list, gap_start: float, gap_end: float) -> list:
-    """Chia doan ho thanh tung cau theo dau ket cau trong chu whisper: [(dau, cuoi, chu)]. Cau qua ngan (< EXTRA_MIN_WORDS
-    chu) gop vao cau sau (cau cuoi: vao cau truoc). Ranh gioi = giua chu cuoi cau truoc va chu dau cau sau."""
-    groups, cur = [], []
-    for w in words:
-        cur.append(w)
-        if EXTRA_SENTENCE_END.search(w.text.strip()):
-            groups.append(cur)
-            cur = []
-    if cur:
-        groups.append(cur)
-    merged = []
-    for g in groups:
-        if merged and len(merged[-1]) < EXTRA_MIN_WORDS:
-            merged[-1] = merged[-1] + g
-        else:
-            merged.append(g)
-    if len(merged) > 1 and len(merged[-1]) < EXTRA_MIN_WORDS:
-        merged[-2:] = [merged[-2] + merged[-1]]
-    out = []
-    for k, g in enumerate(merged):
-        a = gap_start if k == 0 else (merged[k - 1][-1].end + g[0].start) / 2
-        b = gap_end if k + 1 == len(merged) else (g[-1].end + merged[k + 1][0].start) / 2
-        out.append((a, b, g))
-    return out
 
 
 def _text_of(material: dict) -> str:
