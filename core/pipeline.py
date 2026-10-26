@@ -1,7 +1,9 @@
 """Cac buoc xu ly thuan (khong phu thuoc giao dien) - dung chung cho app va CLI."""
+import difflib
 import json
 import os
 import re
+import unicodedata
 from dataclasses import dataclass
 
 import numpy as np
@@ -145,6 +147,11 @@ EXTRA_MIN_SPEECH_SEC = 1.0    # tong khung co tieng (nang luong) trong doan ho
 EXTRA_MIN_WORDS = 3           # so chu whisper co trung diem trong doan ho
 EXTRA_REREAD_SIM = 0.7        # giong noi dung 1 clip bat ky -> "doc lai / loi voice", khong phai cau thua
 EXTRA_REREAD_WARN = 0.55      # cau thua giong 1 clip tu muc nay (duoi EXTRA_REREAD_SIM) -> canh bao "co the doc lai"
+# "Doc lai" phai CUNG CAU voi 1 clip (T-029, bai 195: cau ma cung chu de "Congo" giong 1 clip MiniLM 0.86 bi coi doc lai
+# -> giu -> sot): ngoai MiniLM >= EXTRA_REREAD_SIM con can giong CHU (difflib tren chu whisper bo dau, thuong hoa)
+# >= EXTRA_REREAD_TEXT va ti le do dai chu (cau ma / clip) trong EXTRA_REREAD_LEN.
+EXTRA_REREAD_TEXT = 0.6
+EXTRA_REREAD_LEN = (0.7, 1.4)
 EXTRA_SENTENCE_END = re.compile(r"[.!?。！？…]+[\"'”’»)\]]*$")
 # Giong moi doc cau thua -> XOA het (T-017, nguoi dung chot 2026-10-21 "thua thi xoa het cho khop voice goc"): khong dat track
 # chinh, khong co trong mp4 -> track phu tat tieng + canh bao. Doan ho nhieu cau -> chia thanh nhieu cau ma theo dau ket
@@ -163,8 +170,12 @@ class ExtraSpeech:
     after: int                # chi so clip (timeline) ngay TRUOC doan trong file; -1 = dau file
     before: int               # chi so clip ngay SAU; -1 = cuoi file
     kind: str                 # "thua" | "doc lai" | "manh" | "dau file" | "cuoi file"
-    reread_sim: float = 0.0   # do giong lon nhat voi noi dung 1 clip (doc lai)
+    reread_sim: float = 0.0   # do giong NGHIA (MiniLM) lon nhat voi noi dung 1 clip
     group: int = -1           # doan ho chia nhieu cau: cung so = cung 1 doan ho lien nhau
+    reread: bool = False      # doc lai THAT (cung cau voi 1 clip, _reread_of) -> giu
+    reread_text: float = 0.0  # giong chu voi clip MiniLM >= EXTRA_REREAD_SIM khop nhat (ghi log)
+    reread_len: float = 0.0   # ti le do dai chu voi clip do
+    reread_clip: int = -1     # clip do (-1: khong clip nao MiniLM >= EXTRA_REREAD_SIM)
 
 
 def find_extra_speech(clips: list, source_map: dict, words_by_file: dict, levels_by_file: dict,
@@ -173,7 +184,7 @@ def find_extra_speech(clips: list, source_map: dict, words_by_file: dict, levels
     theo vi tri trong file, sau clip cuoi). Phan loai:
       thua      - giua 2 clip, >= EXTRA_MIN_SPEECH_SEC co tieng, >= EXTRA_MIN_WORDS chu, ket bang dau ket cau,
                   khong giong noi dung clip nao (cau goc da xoa khoi timeline -> giong moi co the doc thua);
-      doc lai   - giong >= EXTRA_REREAD_SIM noi dung 1 clip (ke ca clip file khac: file loi voice / bo sung) -> bo qua;
+      doc lai   - CUNG CAU voi 1 clip (_reread_of; ke ca clip file khac: file loi voice / bo sung) -> bo qua;
       manh      - co tieng nhung ngan / it chu / khong ket cau (cat lem) -> chi canh bao;
       dau file / cuoi file - truoc clip dau / sau clip cuoi cua file -> chi canh bao.
     Giong goc chia nhieu PHAN danh so lien nhau (44.5 -> 44.6): cuoi phan k + dau phan k+1 = 1 doan ho BEN TRONG
@@ -250,13 +261,39 @@ def find_extra_speech(clips: list, source_map: dict, words_by_file: dict, levels
                 if clip_vec is None:
                     clip_vec = embed([t or "" for t in clip_texts])
                 v = embed([piece.text])[0]
-                piece.reread_sim = float(max(clip_vec @ v)) if len(clip_vec) else 0.0
+                sims = clip_vec @ v if len(clip_vec) else np.zeros(0)
+                piece.reread_sim = float(sims.max()) if len(sims) else 0.0
+                _reread_of(piece, sims, clip_texts)
                 # doan 1 cau doc lai -> bo qua (nhu cu); trong doan nhieu cau: van la cau ma, khong xoa (run_worker)
-                if piece.reread_sim >= EXTRA_REREAD_SIM and len(pieces) == 1:
+                if piece.reread and len(pieces) == 1:
                     piece.kind = "doc lai"
         out += pieces
     out.sort(key=lambda e: (files.index(e.path) if e.path in files else len(files), e.start))
     return out
+
+
+def _plain(text: str) -> str:
+    """Chu de so giong CHU: bo dau, thuong hoa, chi giu chu / so, 1 khoang trang."""
+    s = "".join(ch for ch in unicodedata.normalize("NFD", text or "") if not unicodedata.combining(ch)).lower()
+    return " ".join("".join(ch if ch.isalnum() else " " for ch in s).split())
+
+
+def _reread_of(piece, sims, clip_texts):
+    """Doc lai THAT = cung cau voi 1 clip: MiniLM >= EXTRA_REREAD_SIM VA giong chu >= EXTRA_REREAD_TEXT VA ti le do dai
+    chu trong EXTRA_REREAD_LEN (T-029). Xet moi clip MiniLM >= EXTRA_REREAD_SIM; ghi lai clip dat (hoac giong chu nhat)."""
+    mine = _plain(piece.text)
+    for j in np.argsort(-sims):
+        if sims[j] < EXTRA_REREAD_SIM:
+            break
+        other = _plain(clip_texts[j])
+        text = difflib.SequenceMatcher(None, mine, other, autojunk=False).ratio() if mine and other else 0.0
+        length = len(mine) / max(1, len(other))
+        ok = text >= EXTRA_REREAD_TEXT and EXTRA_REREAD_LEN[0] <= length <= EXTRA_REREAD_LEN[1]
+        if ok or piece.reread_clip < 0 or text > piece.reread_text:
+            piece.reread_text, piece.reread_len, piece.reread_clip = text, length, int(j)
+        if ok:
+            piece.reread = True
+            return
 
 
 def _speech_sec(levels, threshold, a: float, b: float, frame_sec: float) -> float:
