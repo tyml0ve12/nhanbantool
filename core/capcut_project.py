@@ -6,9 +6,11 @@ CapCut 6.x luu 2 ban draft_content.json giong het nhau:
   <File Drafts>/Timelines/<main_timeline_id>/draft_content.json
 -> khi ap dung ket qua phai thay CA 2.
 """
+import ctypes
 import json
 import os
 import subprocess
+import time
 from dataclasses import dataclass, field
 
 from core.paths import is_network_path
@@ -152,6 +154,20 @@ class CapCutProject:
     name: str
     folder: str
     modified_us: int
+    in_capcut: bool = True      # False: thu muc project trong thu muc goc nhung CapCut chua mo lan nao (T-031)
+    capcut_root: bool = True    # nam trong thu muc goc CapCut tu nhan (False: chi trong thu muc app nho)
+
+
+# T-031: project vua tai / chep vao thu muc CapCut Drafts ma chua mo bang CapCut thi chua co trong root_meta_info.json
+# -> quet 1 CAP cac thu muc goc: cha cua moi project trong index + thu muc draft mac dinh trong cai dat CapCut + thu muc
+# cha cac project nguoi dung da chon / da chay (app nho, toi da REMEMBERED_ROOTS_MAX). Khong quet o dia / doan thu muc khac.
+REMEMBERED_ROOTS_MAX = 10
+SKIP_DIR_SUFFIXES = (".7z", ".rar", ".zip", ".tmp", ".bak")
+# Moi thu muc goc quet toi da SCAN_MAX_ENTRIES muc / SCAN_MAX_SEC giay (khong treo giao dien). Thu muc app nho nam tren
+# Google Drive (o ao "Google Drive" / duong dan shortcut) -> khong quet (liet ke cham, co the tai file ve).
+SCAN_MAX_ENTRIES = 2000
+SCAN_MAX_SEC = 1.0
+CLOUD_MARKERS = (".shortcut-targets-by-id", "my drive", "drive của tôi", "shared drives", "bộ nhớ dùng chung")
 
 
 def capcut_index_path() -> str:
@@ -161,28 +177,129 @@ def capcut_index_path() -> str:
                         "com.lveditor.draft", "root_meta_info.json")
 
 
-def list_capcut_projects() -> list:
-    """Cac project CapCut dang quan ly, moi sua gan nhat truoc. Loi doc -> []."""
+def _key(folder: str) -> str:
+    return os.path.normcase(os.path.normpath(folder))
+
+
+def _capcut_index() -> list:
+    """[(item, thu muc)] trong root_meta_info.json cua CapCut (ke ca project da xoa). Loi doc -> []."""
     try:
         with open(capcut_index_path(), encoding="utf-8-sig") as f:
             data = json.load(f)
     except (OSError, ValueError):
         return []
+    return [(item, os.path.normpath(item.get("draft_fold_path", ""))) for item in data.get("all_draft_store", [])
+            if item.get("draft_fold_path")]
+
+
+def capcut_default_drafts_dir() -> str:
+    """Thu muc luu draft trong cai dat CapCut (globalSetting: currentCustomDraftPath); khong doc duoc -> ""."""
+    path = os.path.join(os.environ.get("LOCALAPPDATA", ""), "CapCut", "User Data", "Config", "globalSetting")
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if line.startswith("currentCustomDraftPath="):
+                    value = line.split("=", 1)[1].strip().strip('"').replace("\\\\", "\\")
+                    return os.path.normpath(value) if value else ""
+    except OSError:
+        pass
+    return ""
+
+
+def capcut_roots() -> list:
+    """Thu muc goc CapCut tu nhan project: cha cua moi project trong index + thu muc draft mac dinh."""
+    roots = {}
+    for _, folder in _capcut_index():
+        parent = os.path.dirname(folder)
+        roots.setdefault(_key(parent), parent)
+    default = capcut_default_drafts_dir()
+    if default:
+        roots.setdefault(_key(default), default)
+    return list(roots.values())
+
+
+def _on_google_drive(path: str) -> bool:
+    """Thu muc nam tren Google Drive for desktop: duong dan co dau hieu Drive, hoac o dia ten "Google Drive"."""
+    low = os.path.normpath(path).lower()
+    if any(m in low for m in CLOUD_MARKERS):
+        return True
+    drive = os.path.splitdrive(os.path.abspath(path))[0]
+    if os.name != "nt" or not drive or drive.startswith("\\\\"):
+        return False
+    name = ctypes.create_unicode_buffer(261)
+    try:
+        ok = ctypes.windll.kernel32.GetVolumeInformationW(drive + "\\", name, 261, None, None, None, None, 0)
+    except (AttributeError, OSError):
+        return False
+    return bool(ok) and "google drive" in name.value.lower()
+
+
+def remember_root(remembered: list, drafts_dir: str) -> list:
+    """Them thu muc cha cua project vao danh sach thu muc da nho (moi nhat dau, toi da REMEMBERED_ROOTS_MAX)."""
+    parent = os.path.dirname(os.path.normpath(drafts_dir))
+    rest = [r for r in remembered or [] if r and _key(r) != _key(parent)]
+    return ([parent] + rest)[:REMEMBERED_ROOTS_MAX]
+
+
+def list_capcut_projects(remembered=()) -> list:
+    """Project CapCut dang quan ly (index) + project trong cac thu muc goc chua mo bang CapCut (in_capcut=False, quet
+    1 cap, ten = ten thu muc, thoi gian = mtime draft_content.json - khong doc noi dung). Moi sua gan nhat truoc."""
+    index = _capcut_index()
+    known = {_key(folder) for _, folder in index}          # ke ca project da xoa trong CapCut: khong hien lai
     out = []
-    for item in data.get("all_draft_store", []):
-        folder = os.path.normpath(item.get("draft_fold_path", ""))
+    for item, folder in index:
         if item.get("tm_draft_removed") or not os.path.isfile(os.path.join(folder, DRAFT_FILE)):
             continue
         out.append(CapCutProject(item.get("draft_name") or os.path.basename(folder), folder,
                                  int(item.get("tm_draft_modified") or 0)))
+    cc = {_key(r) for r in capcut_roots()}
+    roots = {_key(r): r for r in capcut_roots() + [r for r in remembered or () if r]}
+    for rk, root in roots.items():
+        if is_network_path(root) or (rk not in cc and _on_google_drive(root)):
+            continue
+        try:
+            names = os.listdir(root)[:SCAN_MAX_ENTRIES]
+        except OSError:
+            continue
+        deadline = time.monotonic() + SCAN_MAX_SEC
+        for name in names:
+            if time.monotonic() > deadline:
+                break
+            folder = os.path.join(root, name)
+            if name.startswith((".", "~")) or name.lower().endswith(SKIP_DIR_SUFFIXES) or _key(folder) in known:
+                continue
+            draft = os.path.join(folder, DRAFT_FILE)
+            try:
+                mtime = os.path.getmtime(draft)
+            except OSError:              # khong phai thu muc / khong co draft_content.json
+                continue
+            known.add(_key(folder))
+            out.append(CapCutProject(name, os.path.normpath(folder), int(mtime * US), in_capcut=False,
+                                     capcut_root=rk in cc))
     return sorted(out, key=lambda p: p.modified_us, reverse=True)
 
 
+def capcut_status(drafts_dir: str) -> str:
+    """"index": project CapCut dang quan ly; "root": nam trong thu muc goc cua CapCut nhung chua mo (CapCut tu nhan khi
+    mo - T-031, khong chan chay); "removed": da XOA trong CapCut (thu muc con) -> CapCut khong hien, canh bao nhu
+    "outside"; "outside": ngoai cac thu muc do -> CapCut se khong doc thay doi ghi vao day (loi that da gap: sua nham ban
+    copy)."""
+    target = _key(drafts_dir)
+    removed = False
+    for item, folder in _capcut_index():
+        if _key(folder) == target:
+            if not item.get("tm_draft_removed"):
+                return "index"
+            removed = True
+    if removed:
+        return "removed"
+    parent = _key(os.path.dirname(os.path.normpath(drafts_dir)))
+    return "root" if any(_key(r) == parent for r in capcut_roots()) else "outside"
+
+
 def is_registered_in_capcut(drafts_dir: str) -> bool:
-    """Thu muc nay co dung la project CapCut dang mo khong? Neu khong, CapCut se
-    khong bao gio doc thay doi ghi vao day (loi that da gap: sua nham ban copy)."""
-    target = os.path.normcase(os.path.normpath(drafts_dir))
-    return any(os.path.normcase(p.folder) == target for p in list_capcut_projects())
+    """Project CapCut se thay thay doi (dang quan ly, hoac trong thu muc goc CapCut tu nhan - T-031)."""
+    return capcut_status(drafts_dir) in ("index", "root")
 
 
 def is_capcut_running() -> bool:
