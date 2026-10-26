@@ -18,7 +18,7 @@ from core import draft_patch
 from core.applog import make_support_zip
 from core.capcut_project import (
     ProjectError, load_project, scan_audio_folder, language_name_from_file,
-    list_capcut_projects, is_registered_in_capcut,
+    list_capcut_projects, capcut_status, remember_root,
     is_capcut_running, format_us, AUDIO_EXTS,
 )
 from core.speech import detect_device, is_model_downloaded
@@ -41,6 +41,9 @@ APP_TITLE = f"Nhân Bản Lồng Tiếng — {APP_SIGNATURE}"
 
 COL_CHECK, COL_NAME, COL_AUDIO, COL_LOGO, COL_STATUS = range(5)
 LANG_STATUS_COLORS = {"ok": "#e8e8e8", "warn": "#e0b04a", "error": "#ff6b6b"}
+# T-031: project trong thu muc CapCut Drafts nhung CapCut chua mo lan nao
+NOT_OPENED_NOTE = ("Project chưa mở trong CapCut — mở CapCut để thấy project "
+                   "(CapCut tự nhận thư mục trong CapCut Drafts)")
 
 # (nhan hien thi, ten model faster-whisper). Model tai ve 1 lan o lan chay dau.
 WHISPER_MODELS = (
@@ -209,14 +212,23 @@ class MainWindow(QMainWindow):
     def _refresh_capcut_projects(self):
         current = self.capcut_combo.currentData()
         self.capcut_combo.clear()
-        for p in list_capcut_projects():
+        for p in list_capcut_projects(self._remembered_roots()):
             when = datetime.fromtimestamp(p.modified_us / 1e6).strftime("%d/%m/%Y %H:%M") if p.modified_us else ""
-            self.capcut_combo.addItem(f"{p.name}   ·   sửa {when}", p.folder)
+            note = "" if p.in_capcut else "   (chưa mở trong CapCut)" if p.capcut_root else "   (chưa có trong CapCut)"
+            self.capcut_combo.addItem(f"{p.name}   ·   sửa {when}{note}", p.folder)
         if not self.capcut_combo.count():
             self.capcut_combo.lineEdit().setPlaceholderText("Không đọc được danh sách project của CapCut — "
                                                             "hãy chọn thư mục bên dưới")
         idx = self.capcut_combo.findData(current) if current else -1
         self.capcut_combo.setCurrentIndex(idx)
+
+    def _remembered_roots(self) -> list:
+        """Thu muc cha cac project nguoi dung da chon / da chay (T-031) - quet 1 cap tim project chua mo trong CapCut."""
+        value = self.settings.value("project_roots", [])
+        return [value] if isinstance(value, str) else list(value or [])
+
+    def _remember_project_root(self, drafts_dir):
+        self.settings.setValue("project_roots", remember_root(self._remembered_roots(), drafts_dir))
 
     def _on_capcut_project_chosen(self, index):
         folder = self.capcut_combo.itemData(index)
@@ -365,6 +377,7 @@ class MainWindow(QMainWindow):
         path = QFileDialog.getExistingDirectory(self, "Chọn thư mục project CapCut", self.project_edit.text())
         if path:
             self.project_edit.setText(os.path.normpath(path))
+            self._remember_project_root(os.path.normpath(path))
             self._load_project(path)
 
     def _browse_video(self):
@@ -406,10 +419,15 @@ class MainWindow(QMainWindow):
 
         summary = (f"CapCut {info.app_version} · dài {format_us(info.duration_us)} · "
                    f"{main.segment_count} câu thoại · sẽ cập nhật {len(info.draft_files)} file draft")
-        self.project_registered = is_registered_in_capcut(info.drafts_dir)
-        if self.project_registered:
+        status = capcut_status(info.drafts_dir)
+        self.project_registered = status != "outside"
+        if status == "index":
             self.project_info.setObjectName("projectInfo")
             self.project_info.setText(summary)
+        elif status == "root":           # T-031: thu muc trong CapCut Drafts chua mo -> van chay, CapCut tu nhan khi mo
+            self.project_info.setObjectName("projectInfo")
+            self.project_info.setText(f"{summary}\n{NOT_OPENED_NOTE}")
+            self._log(NOT_OPENED_NOTE)
         else:
             self.project_info.setObjectName("projectError")
             self.project_info.setText(
@@ -637,6 +655,7 @@ class MainWindow(QMainWindow):
             if answer != QMessageBox.StandardButton.Yes:
                 return
 
+        self._remember_project_root(self.project.drafts_dir)
         track_index = self.track_combo.currentData()
         track = next(t for t in self.project.audio_tracks if t.index == track_index)
         jobs = []
