@@ -85,6 +85,7 @@ class RunWorker(QThread):
         self._onset_src = None      # nguon onset tung clip (ghi log chi tiet)
         self._text_src = None       # nguon noi dung tung cau goc (ghi log chi tiet)
         self._extras = []           # doan co tieng trong file giong goc khong thuoc clip nao (pipeline.ExtraSpeech)
+        self._orig_files = []       # duong dan THAT cac file giong goc (ghep cho nguoi dung sau khi chay - T-030)
 
     def stop(self):
         self._stop = True
@@ -201,8 +202,39 @@ class RunWorker(QThread):
 
         if uses_draft and not draft_first and results:
             pending_apply = self._write_draft(draft, results)
+        self._merge_original_parts()
         self.progress.emit(100)
         return ok, err, pending_apply
+
+    def _merge_original_parts(self):
+        """Giong goc chia nhieu PHAN lien nhau (44.1 ... 44.12: pipeline._next_part) -> ghep "<thu muc> Ghép.mp3" trong
+        thu muc cac phan, CHI de nguoi dung dung khi dung video (T-030). Tool van doc tung file goc, draft khong doi.
+        Loi chi canh bao, khong hong lan chay."""
+        files = parts.sort_parts([p for p in getattr(self, "_orig_files", []) if not parts.is_merged_file(p)])
+        chains, cur = [], []
+        for path in files:
+            if cur and os.path.dirname(path) == os.path.dirname(cur[-1]) and pipeline._next_part(cur[-1], path):
+                cur.append(path)
+            else:
+                if len(cur) > 1:
+                    chains.append(cur)
+                cur = [path]
+        if len(cur) > 1:
+            chains.append(cur)
+        voice_files = {os.path.normcase(os.path.abspath(j.audio_path)) for j in self.config.languages
+                       if getattr(j, "audio_path", "")}
+        for chain in chains:
+            try:
+                target = parts.merged_target(chain)
+                if target and os.path.normcase(os.path.abspath(target)) in voice_files:
+                    raise audio.AudioError("trùng tên với file ghép voice nhân bản cùng thư mục")
+                out, existed = parts.merge_for_editor(chain)
+                self.log.emit(f"Giọng gốc {len(chain)} phần: {'đã có' if existed else 'đã ghép'} → {out} "
+                              "(chỉ để dựng video, tool vẫn đọc từng phần).")
+            except Exception as e:     # khong hong lan chay
+                log.warning("Khong ghep duoc giong goc %s: %s", os.path.dirname(chain[0]), e)
+                self.log.emit(f"Cảnh báo: không ghép được giọng gốc {len(chain)} phần trong thư mục "
+                              f"{os.path.dirname(chain[0])} ({e}).")
 
     # ------------------------------------------------------------------
     def _original_texts(self, draft, clips):
@@ -270,6 +302,7 @@ class RunWorker(QThread):
                     search_roots.append(r)
         search_roots.append(os.path.dirname(self.config.project_dir))
         sources = pipeline.resolve_original_sources(clips, search_roots)
+        self._orig_files = sorted({p for p in sources.values() if p})
         shown = {}      # duong dan doc (ban chep neu co) -> ten that de hien
         for key, path in list(sources.items()):
             if path and path_too_long(path):      # giong goc nam sau (Google Drive) -> chep ra cache duong dan ngan
@@ -365,12 +398,12 @@ class RunWorker(QThread):
         cfg = self.config
         if len(job.parts) > 1:
             self.language_status.emit(job.row, f"Ghép {len(job.parts)} phần…", "run")
-            job.audio_path, reused = parts.merge_parts(job.parts, job.name, cfg.project_dir)
+            job.audio_path, reused, note = parts.merge_parts(job.parts, job.name, cfg.project_dir)
             self.log.emit(f"[{job.name}] {'Dùng lại' if reused else 'Đã ghép'} {len(job.parts)} phần → "
                           f"{os.path.basename(job.audio_path)}")
-            if os.path.dirname(os.path.abspath(job.audio_path)) != os.path.dirname(os.path.abspath(job.parts[0])):
-                self.log.emit(f"[{job.name}] Các phần nằm trên Google Drive / thư mục quá sâu → file ghép đặt trong "
-                              f"project: {job.audio_path}")
+            if note:                    # khong ghi duoc canh cac phan -> file ghep o project (T-030)
+                self.log.emit(f"[{job.name}] Cảnh báo: {note}")
+                self._warned_rows.add(job.row)
         else:
             job.audio_path = job.parts[0]
         self.language_status.emit(job.row, "Nhận dạng giọng nói…", "run")
