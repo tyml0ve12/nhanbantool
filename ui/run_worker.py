@@ -207,7 +207,7 @@ class RunWorker(QThread):
         return ok, err, pending_apply
 
     def _merge_original_parts(self):
-        """Giong goc chia nhieu PHAN lien nhau (44.1 ... 44.12: pipeline._next_part) -> ghep "<thu muc> Ghép.mp3" trong
+        """Giong goc chia nhieu PHAN lien nhau (44.1 ... 44.12: pipeline._next_part) -> ghep "<ten cac phan bo so> Ghép.mp3" trong
         thu muc cac phan, CHI de nguoi dung dung khi dung video (T-030). Tool van doc tung file goc, draft khong doi.
         Loi chi canh bao, khong hong lan chay."""
         files = parts.sort_parts([p for p in getattr(self, "_orig_files", []) if not parts.is_merged_file(p)])

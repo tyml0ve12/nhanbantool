@@ -31,7 +31,7 @@ def sort_parts(paths: list) -> list:
 
 
 def is_merged_file(path: str) -> bool:
-    """File ghep cua tool: "<thu muc> Ghép.mp3" (T-030) hoac kieu cu "<ngon ngu> (gộp).mp3" - khong lay lai lam 1 phan.
+    """File ghep cua tool: "<ten cac phan> Ghép.mp3" (T-030) hoac kieu cu "<ngon ngu> (gộp).mp3" - khong lay lai lam 1 phan.
     Ke ca file DO DANG cua lan ghep bi ngat (tool tat giua chung / Drive khoa khong xoa duoc): "... Ghép.mp3.part.mp3",
     "... (gộp).mp3.part.mp3" va file ghi thu ".nhanban_ghi_thu.tmp" (QA T-030: file do dang bi lay lam phan 1)."""
     name = unicodedata.normalize("NFC", os.path.basename(path))
@@ -63,7 +63,7 @@ def numbering_problem(paths: list) -> str:
     return f"thiếu phần {', '.join(map(str, missing))}" if missing else ""
 
 
-# File ghep (T-030, nguoi dung chot 26/10): "<ten thu muc chua cac phan> Ghép.mp3" ngay trong thu muc do (ke ca Google
+# File ghep (T-030, nguoi dung chot 26/10; hotfix ten 26/10): "<ten cac phan bo so thu tu> Ghép.mp3" ngay trong thu muc do (ke ca Google
 # Drive); chi khi ghi loi (khong quyen / duong dan qua dai) moi luu vao <project>\voice nhan ban\ + canh bao.
 MERGED_TAG = " Ghép"
 MERGED_EXT = ".mp3"
@@ -92,10 +92,29 @@ def _fit_in(folder: str, stem: str, suffix: str):
     return os.path.join(folder, f"{stem[-room:].lstrip()}{tag}{suffix}")
 
 
+def merged_name(parts: list) -> str:
+    """Ten file ghep (khong duoi) = ten cac phan BO so thu tu phan (hotfix 26/10: giu ten giong doc). Vd "289 tây 1_full",
+    "289 tây 2_full" -> "289 tây_full"; "176 Đức 1" -> "176 Đức"; "44.1 tbn", "44.12 tbn" -> "44 tbn". Cac phan chi la
+    so (1.mp3, 2.mp3) -> ten thu muc chua cac phan."""
+    stems = [unicodedata.normalize("NFC", os.path.splitext(os.path.basename(p))[0]) for p in parts]
+    head = os.path.commonprefix(stems)
+    tail = os.path.commonprefix([x[::-1] for x in stems])[::-1] if len(stems) > 1 else ""
+    if len(head) + len(tail) > min(len(x) for x in stems):     # 1 phan / ten trung: phan dau va duoi chong nhau
+        tail = ""
+    head = head.rstrip("0123456789").rstrip(" ._-(")
+    tail = tail.lstrip("0123456789").lstrip(" .-)")
+    name = head + tail if tail.startswith("_") else f"{head} {tail}"
+    name = re.sub(r"\s+", " ", name).strip(" ._-")
+    if not any(ch.isalpha() for ch in name):                   # chi con so / rong -> ten thu muc
+        name = os.path.basename(os.path.dirname(os.path.abspath(parts[0])))
+    return _safe(name)
+
+
 def merged_target(parts: list, folder: str = None):
-    """File ghep "<ten thu muc chua cac phan> Ghép.mp3" trong `folder` (mac dinh thu muc phan 1); None neu qua dai."""
+    """File ghep "<ten cac phan bo so thu tu> Ghép.mp3" (merged_name) trong `folder` (mac dinh thu muc phan 1); None neu
+    qua dai."""
     src_folder = os.path.dirname(os.path.abspath(parts[0]))
-    return _fit_in(folder or src_folder, _safe(os.path.basename(src_folder)), MERGED_TAG + MERGED_EXT)
+    return _fit_in(folder or src_folder, merged_name(parts), MERGED_TAG + MERGED_EXT)
 
 
 def _signature(parts: list) -> list:
@@ -155,7 +174,7 @@ def _concat(parts: list, out: str, signature: list):
 
 def merge_parts(parts: list, language: str, fallback_dir: str = "") -> tuple:
     """Ghep cac phan voice nhan ban thanh 1 file mp3 - CapCut can 1 file lam material. Tra ve (duong_dan, da_dung_lai,
-    canh_bao). Dich: "<ten thu muc chua cac phan> Ghép.mp3" ngay trong thu muc do (ke ca Google Drive). Khong ghi duoc
+    canh_bao). Dich: "<ten cac phan bo so thu tu> Ghép.mp3" ngay trong thu muc do (ke ca Google Drive). Khong ghi duoc
     (khong quyen / duong dan qua dai / loi ghi) -> `fallback_dir`/voice nhan ban/ + canh bao. Dung lai file ghep da co
     cung chu ky (ca kieu cu "<ngon ngu> (gộp).mp3") -> giu duoc cache nhan dang giong noi."""
     signature = _signature(parts)
@@ -180,7 +199,7 @@ def merge_parts(parts: list, language: str, fallback_dir: str = "") -> tuple:
     else:
         reason = "đường dẫn quá dài" if target is None else "không có quyền ghi"
     if not backup:
-        raise audio.AudioError(long_path_message(os.path.join(folder, _safe(os.path.basename(folder)) + MERGED_TAG + MERGED_EXT))
+        raise audio.AudioError(long_path_message(os.path.join(folder, merged_name(parts) + MERGED_TAG + MERGED_EXT))
                                if target is None else f"Không ghi được file ghép vào thư mục {folder} ({reason}).")
     os.makedirs(fb_dir, exist_ok=True)
     _concat(parts, backup, signature)
@@ -188,7 +207,7 @@ def merge_parts(parts: list, language: str, fallback_dir: str = "") -> tuple:
 
 
 def merge_for_editor(parts: list) -> tuple:
-    """Ghep cac phan GIONG GOC thanh "<ten thu muc> Ghép.mp3" trong thu muc cac phan - CHI de nguoi dung dung khi dung
+    """Ghep cac phan GIONG GOC thanh "<ten cac phan bo so thu tu> Ghép.mp3" trong thu muc cac phan - CHI de nguoi dung dung khi dung
     video (tool van doc tung file goc, draft khong doi). Tra ve (duong_dan, da_co_san). Loi -> AudioError / OSError."""
     signature = _signature(parts)
     target = merged_target(parts)
