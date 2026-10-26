@@ -25,6 +25,25 @@ MIN_SUBTITLE_COVER = 0.8   # phu de phu it hon muc nay -> nhan dang giong goc th
 EXTRA_ROOM_SEC = 0.3       # cau thua GIU (doc lai) dat track chinh khi khoang trong >= loi cau + 0.3s
 EDGE_LOUD_DB = 15           # mep nghe duoc to hon nen muc nay = nam giua tieng noi -> vuot dai (T-001, COO chot 15)
 EDGE_RAMP_US = 25_000       # vuot 25ms (CapCut + mp4) thay vi 10ms o mep giua tieng to
+# Ha tieng LAY HOI (T-027 vong 2, tieu chi Tester BAO_CAO_TESTER muc 21.6 / t027/loud2.py; COO chot cho ha CA khung vuot
+# nguong tieng noi khi dat du luat): quet CA file voice - khung "hoi" = > nen + BREATH_ABOVE_FLOOR_DB, khong cao do
+# (r < BREATH_R_VOICED), hf < BREATH_HF_FRIC; cum = khung hoi lien nhau (cho 1 khung le), >= BREATH_MIN_SEC, < BREATH_VOICED_RUN
+# khung co cao do; TACH 2 ben khoi tieng khong phai hoi (tut >= BREATH_DIP_DB duoi trung vi cum / lang); cach phan co cao do
+# cua chu TRUOC >= BREATH_PREV_GAP_SEC (am bat cuoi t/k/p); khong nam trong 1 chu whisper da co tieng co cao do truoc cum.
+# Vung ha = cum giao phan nghe duoc cua doan (dau / giua sau dau phay / duoi cau) -> draft_patch.DUCK_GAIN (-20 dB).
+BREATH_ABOVE_FLOOR_DB = 10
+BREATH_DIP_DB = 6
+BREATH_R_VOICED = 0.6
+BREATH_VOICED_RUN = 3
+BREATH_HF_FRIC = 0.5
+BREATH_MIN_SEC = 0.1
+BREATH_MAX_SEC = 0.8         # QA muc 27: cum dai hon khong phai 1 hoi tho (thi tham / cuoi / on) -> khong ha
+BREATH_PREV_GAP_SEC = 0.12
+# Tester muc 21.7 (25 vung la DUOI CHU): chu whisper "chua" cum tinh ca chu het ngay cuoi cum (-50ms); nguyen am yeu cuoi chu
+# (trung vi hf < 0.05 va cach phan co cao do chu truoc < 0.25s) -> giu
+BREATH_WORD_END_SLACK = 0.05
+BREATH_TAIL_HF = 0.05
+BREATH_TAIL_GAP_SEC = 0.25
 ALT_ORDER_MIN_GAIN = 0.02   # phuong an B (T-026) chi dung khi do khop cao hon ro (hoac thu tu cu loi)
 TAIL_EARLY_SEC = 30        # doan cuoi voice dat truoc clip cuoi hon 30s -> canh bao do "Duoi voice" (viec #6b)
 
@@ -470,6 +489,14 @@ class RunWorker(QThread):
         placements, place_dbg, job.extra_placements, extra_notes = self._place_extras(
             job, ghosts, clips, by_clip, spans, onsets, timeline_end, placements, place_dbg)
         job.edge_ramps = self._edge_ramps(placements, levels)
+        try:
+            job.breath_ducks, breath_dbg = self._breath_ducks(placements, place_dbg, by_clip, spans, levels,
+                                                              job.audio_path, words)
+        except Exception as e:          # loi ha hoi tho khong duoc lam hong ca ngon ngu (QA muc 27) -> bo ha hoi
+            log.warning("[%s] Ha tieng lay hoi loi, bo qua (giu nguyen tieng): %s", job.name, e, exc_info=True)
+            job.breath_ducks, breath_dbg = [], {}
+        log.info("[%s] Ha tieng lay hoi: %d/%d cau, %d vung, tong %.1fs", job.name, len(breath_dbg), len(placements),
+                 sum(len(rs) for rs in breath_dbg.values()), sum(b - a for rs in breath_dbg.values() for a, b in rs))
         loud = sum((h > draft_patch.MUTE_RAMP_US) + (t > draft_patch.MUTE_RAMP_US) for h, t in job.edge_ramps)
         log.info("[%s] Mep nghe duoc giua tieng to (> nen + %d dB): %d/%d mep -> vuot %dms", job.name, EDGE_LOUD_DB,
                  loud, 2 * len(placements), EDGE_RAMP_US // 1000)
@@ -513,7 +540,7 @@ class RunWorker(QThread):
         try:
             self._log_details(job, clips, by_clip, result, source_texts, spans, span_dbg, placements, place_dbg,
                               dict(lang=lang, dur=dur, words=len(words), cached=cached,
-                                   silences=len(silences), loose=loose))
+                                   silences=len(silences), loose=loose, breath=breath_dbg))
             self.log.emit(f"[{job.name}] Đã ghi chi tiết từng câu vào file log.")
         except Exception:
             log.exception("Loi khi ghi log chi tiet %s", job.name)     # ghi log hong khong lam hong ket qua
@@ -631,7 +658,9 @@ class RunWorker(QThread):
                                f" TH1={sec(pd['th1_us']):+.3f} TH2={sec(pd['th2_us']):+.3f}"
                                f" rut_nghe_duoc={sec(pd['aud_head_cut_us']):.3f}/{sec(pd['aud_tail_cut_us']):.3f}"
                                f" rut_keo_dai={sec(pd['head_cut_us']):.3f}/{sec(pd['tail_cut_us']):.3f}"
-                               + (f" bo_lang_dau={sec(pd['trim_start_us']):.3f}" if pd["trim_start_us"] else ""))
+                               + (f" bo_lang_dau={sec(pd['trim_start_us']):.3f}" if pd["trim_start_us"] else "")
+                               + "".join(" | ha hoi {:.3f}-{:.3f}s".format(a, b)
+                                         for a, b in info.get("breath", {}).get(i, [])))
             for w in per_sentence.get(label, []):
                 row.append(f"CANH BAO: {short(w, 200)}")
             log.info(" | ".join(row))
@@ -650,7 +679,9 @@ class RunWorker(QThread):
         try:
             audio.build_dub_wav(job.audio_path, [tuple(v / US for v in p) for p in placements],
                                 video_duration, wav,
-                                [(h / US, t / US) for h, t in getattr(job, "edge_ramps", None) or []] or None)
+                                [(h / US, t / US) for h, t in getattr(job, "edge_ramps", None) or []] or None,
+                                [[(a / US, b / US) for a, b in x] for x in getattr(job, "breath_ducks", None) or []]
+                                or None)
 
             def on_progress(p, speed, eta):
                 self.language_status.emit(job.row, f"Đang render {p}%", "run")
@@ -705,6 +736,74 @@ class RunWorker(QThread):
             out.append((EDGE_RAMP_US if k != first and loud(source + head) else draft_patch.MUTE_RAMP_US,
                         EDGE_RAMP_US if k != last and loud(source + dur - tail) else draft_patch.MUTE_RAMP_US))
         return out
+
+    @staticmethod
+    def _breath_ducks(placements, place_dbg, by_clip, spans, levels, audio_path, words=()) -> tuple:
+        """Ha tieng lay hoi (T-027 vong 2, xem BREATH_*): moi doan track chinh -> [(dau, cuoi)] vung ha (us, vi tri trong
+        doan), va {chi so clip: [(a, b)] giay trong file voice} de ghi log. Khong doi cho cat / luc noi / TH1."""
+        import numpy as np
+        if not len(levels) or not placements:
+            return [], {}
+        fs = audio.LEVEL_FRAME_SEC
+        N = len(levels)
+        db = levels - pipeline.level_floor(levels)
+        R, H = audio.pitch_hf_frames(audio_path, N, fs)
+        voiced = (R >= BREATH_R_VOICED) & (db > BREATH_ABOVE_FLOOR_DB)
+        bm = (db > BREATH_ABOVE_FLOOR_DB) & (R < BREATH_R_VOICED) & (H < BREATH_HF_FRIC)
+        for i in range(1, N - 1):                                   # cho 1 khung le trong cum
+            if not bm[i] and bm[i - 1] and bm[i + 1] and db[i] > BREATH_ABOVE_FLOOR_DB:
+                bm[i] = True
+
+        def runs_of(mask):
+            res, s = [], None
+            for i, x in enumerate(list(mask) + [False]):
+                if x and s is None:
+                    s = i
+                elif not x and s is not None:
+                    res.append((s, i)); s = None
+            return res
+
+        ws = [w for w in words if w.text.strip()]
+        found = []
+        for a, b in runs_of(bm):
+            if (b - a) * fs < BREATH_MIN_SEC - 1e-9 or (b - a) * fs > BREATH_MAX_SEC + 1e-9:
+                continue                                            # qua ngan / qua dai (thi tham, cuoi, on)
+            if max((q - p for p, q in runs_of(voiced[a:b])), default=0) >= BREATH_VOICED_RUN:
+                continue
+            lvl = float(np.median(db[a:b]))
+            nxt = next((j for j in range(b, min(N, b + 100)) if db[j] > BREATH_ABOVE_FLOOR_DB and not bm[j]), None)
+            prv = next((j for j in range(a - 1, max(-1, a - 100), -1) if db[j] > BREATH_ABOVE_FLOOR_DB and not bm[j]), None)
+
+            def sep(lo, hi):
+                return hi <= lo or min(db[lo:hi]) <= lvl - BREATH_DIP_DB or min(db[lo:hi]) <= BREATH_ABOVE_FLOOR_DB
+
+            if not (nxt is None or (nxt > b and sep(b, nxt))) or not (prv is None or (prv < a - 1 and sep(prv + 1, a))):
+                continue
+            if next((j for j in range(b, N) if voiced[j]), None) is None:
+                continue
+            v_before = next((j for j in range(a - 1, -1, -1) if voiced[j]), None)
+            gap_prev = (a - 1 - v_before) * fs if v_before is not None else 9.0
+            if gap_prev < BREATH_PREV_GAP_SEC:
+                continue                                            # am bat cuoi chu truoc (t / k / p)
+            # nguyen am yeu cuoi chu (whisper cat som, r < 0.6, hf ~ 0): pho gan nhu khong co tan cao + sat chu truoc
+            if float(np.median(H[a:b])) < BREATH_TAIL_HF and gap_prev < BREATH_TAIL_GAP_SEC:
+                continue
+            t0, t1 = a * fs, b * fs
+            # nam trong 1 chu whisper (ke ca chu het ngay cuoi cum, -50ms) da co tieng co cao do truoc cum -> am cua chu
+            # (vd /k/ cua 'because'; "-ta" cua "testa," 125 BDN)
+            if any(w.start < t0 and w.end >= t1 - BREATH_WORD_END_SLACK - 1e-6 and voiced[int(w.start / fs):a].any() for w in ws):
+                continue
+            found.append((t0, t1))
+        out, dbg = [], {}
+        for p, d in zip(placements, place_dbg):
+            src = p[1] / US
+            aud0, aud1 = src + p[3] / US, src + (p[2] - p[4]) / US
+            regs = [(max(t0, aud0), min(t1, aud1)) for t0, t1 in found if t0 < aud1 and t1 > aud0]
+            regs = [(a, b) for a, b in regs if b - a >= 2 * draft_patch.DUCK_RAMP_US / US]
+            out.append([(int(round((a - src) * US)), int(round((b - src) * US))) for a, b in regs])
+            if regs and isinstance(d.get("clip"), int):
+                dbg[d["clip"]] = regs
+        return out, dbg
 
     @staticmethod
     def _early_tail(placements, clips) -> str:
@@ -859,7 +958,8 @@ class RunWorker(QThread):
         audible = cfg.default_language if cfg.default_language in names else names[0]
         tracks = [draft_patch.LanguageTrack(job.name, job.audio_path, dur_us, placements, job.name == audible,
                                             list(getattr(job, "extra_placements", None) or []),
-                                            list(getattr(job, "edge_ramps", None) or []))
+                                            list(getattr(job, "edge_ramps", None) or []),
+                                            list(getattr(job, "breath_ducks", None) or []))
                   for job, placements, dur_us in results]
         dubbed = draft_patch.build_dubbed_draft(draft, cfg.track_index, tracks)
         draft_patch.validate_dubbed(dubbed, draft["tracks"][cfg.track_index]["id"], tracks)

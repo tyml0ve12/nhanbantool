@@ -45,6 +45,8 @@ class LanguageTrack:
     # Vuot am luong tung doan [(ramp_dau_us, ramp_cuoi_us)] song song placements (T-001: mep giua tieng to vuot dai
     # hon); rong -> MUTE_RAMP_US moi mep nhu cu
     ramps: list = field(default_factory=list)
+    # Ha tieng lay hoi dau / duoi cau (T-027): [[(dau, cuoi) vung ha (vi tri trong doan, us)]] song song placements
+    ducks: list = field(default_factory=list)
 
 
 EXTRA_TRACK_SUFFIX = " – câu thừa"
@@ -61,6 +63,8 @@ def extra_track_name(language: str) -> str:
 # moi doan cat tu giua file deu CAM. (Tool edit nhac khong gap vi clip nhac thuong cat tu giay 0.)
 KF_VOLUME_TYPE = "KFTypeVolume"
 MUTE_RAMP_US = 10_000      # vuot 10ms o cho tat/mo tieng -> khong nghe tieng "tach"
+DUCK_GAIN = 0.1             # ha tieng lay hoi dau cau -20 dB (T-027)
+DUCK_RAMP_US = 10_000       # vuot 10ms o 2 mep vung ha
 
 
 def _volume_keyframe(time_offset_us: int, value: float) -> dict:
@@ -70,11 +74,14 @@ def _volume_keyframe(time_offset_us: int, value: float) -> dict:
 
 
 def mute_keyframes(duration_us: int, mute_head_us: int, mute_tail_us: int, source_start_us: int,
-                   ramp_head_us: int = MUTE_RAMP_US, ramp_tail_us: int = MUTE_RAMP_US) -> list:
+                   ramp_head_us: int = MUTE_RAMP_US, ramp_tail_us: int = MUTE_RAMP_US, ducks=None) -> list:
     """Keyframe am luong cho 1 doan: tat (0) phan keo dai dau/cuoi, 100% o giua. [] neu khong can.
     source_start_us: doan cat tu dau trong file audio - time_offset = source_start_us + vi tri trong doan.
     ramp_*_us > MUTE_RAMP_US: mep nghe duoc nam giua tieng to (giong doc lien, T-001) -> vuot dai hon, ke ca khi
-    khong co phan keo dai (0 -> 100% trong ramp tu dau doan)."""
+    khong co phan keo dai (0 -> 100% trong ramp tu dau doan).
+    ducks [(dau_us, cuoi_us)] vi tri trong doan: HA TIENG LAY HOI dau / duoi cau (T-027) - am luong DUCK_GAIN (-20 dB),
+    vuot DUCK_RAMP_US trong vung; vung cham dau / cuoi phan nghe duoc thi noi lien phan tat tieng. Am luong moi diem =
+    min(duong tat tieng, duong ha hoi)."""
     points = []
     off = duration_us - mute_tail_us
     # Vung nghe duoc ngan hon 2 lan vuot -> vuot ngan lai (moi ben toi da nua vung), giu thu tu diem tang dan
@@ -84,18 +91,54 @@ def mute_keyframes(duration_us: int, mute_head_us: int, mute_tail_us: int, sourc
         points += [(0, 0.0), (mute_head_us, 0.0), (mute_head_us + ramp_head, 1.0)]
     if mute_tail_us > 0 or ramp_tail_us > MUTE_RAMP_US:
         points += [(off - ramp_tail, 1.0), (off, 0.0), (duration_us, 0.0)]
-    if not points:
+    duck_pts = _duck_points(ducks, mute_head_us, off, duration_us)
+    if not points and not duck_pts:
         return []
     # Luon co diem o 2 mep doan -> khong phu thuoc cach CapCut ngoai suy truoc diem dau / sau diem cuoi
-    if points[0][0] > 0:
+    if not points or points[0][0] > 0:
         points.insert(0, (0, 1.0))
     if points[-1][0] < duration_us:
         points.append((duration_us, 1.0))
     by_offset = {}
     for t, v in points:
         by_offset[int(t)] = v            # trung vi tri -> diem sau thang
+    if duck_pts:
+        mute = sorted(by_offset.items())
+        times = sorted(set(by_offset) | {t for t, _ in duck_pts})
+        by_offset = {t: min(_interp(mute, t), _interp(duck_pts, t)) for t in times}
     kfs = [_volume_keyframe(source_start_us + t, v) for t, v in sorted(by_offset.items())]
     return [{"id": _new_id(), "material_id": "", "property_type": KF_VOLUME_TYPE, "keyframe_list": kfs}]
+
+
+def _duck_points(ducks, aud_start: int, aud_end: int, duration_us: int) -> list:
+    """Duong ha hoi [(t, he so)] tang dan (1 ngoai vung, DUCK_GAIN trong vung, vuot DUCK_RAMP_US trong vung); vung cham
+    dau / cuoi phan nghe duoc -> DUCK_GAIN keo toi mep doan (min voi phan tat tieng). [] neu khong co vung hop le."""
+    pts = []
+    for start, end in sorted(ducks or []):
+        start, end = max(int(start), aud_start), min(int(end), aud_end)
+        if end - start < 2 * DUCK_RAMP_US:
+            continue
+        head = start <= aud_start
+        tail = end >= aud_end
+        pts += [(0, DUCK_GAIN)] if head else [(start, 1.0), (start + DUCK_RAMP_US, DUCK_GAIN)]
+        pts += [(duration_us, DUCK_GAIN)] if tail else [(end - DUCK_RAMP_US, DUCK_GAIN), (end, 1.0)]
+    if not pts:
+        return []
+    if pts[0][0] > 0:
+        pts.insert(0, (0, 1.0))
+    if pts[-1][0] < duration_us:
+        pts.append((duration_us, 1.0))
+    return pts
+
+
+def _interp(points: list, t: int) -> float:
+    """Gia tri duong gap khuc [(t, v)] tang dan tai t (noi suy tuyen tinh; ngoai doan: diem gan nhat)."""
+    if t <= points[0][0]:
+        return points[0][1]
+    for (t0, v0), (t1, v1) in zip(points, points[1:]):
+        if t <= t1:
+            return v1 if t1 == t0 else v0 + (v1 - v0) * (t - t0) / (t1 - t0)
+    return points[-1][1]
 
 
 def _new_id() -> str:
@@ -165,7 +208,7 @@ def build_dubbed_draft(draft: dict, track_index: int, languages: list) -> dict:
         materials.setdefault("audios", []).append(material)
 
         new_track = _new_dub_track(d, orig_track, template_seg, index, materials, material, lang.name, lang.placements,
-                                   lang.ramps)
+                                   lang.ramps, ducks=lang.ducks)
         # Chi 1 ngon ngu bat tieng; cac ngon ngu khac tat bang nut tat tieng track
         set_track_muted(new_track, not lang.audible)
         d["tracks"].append(new_track)
@@ -178,11 +221,11 @@ def build_dubbed_draft(draft: dict, track_index: int, languages: list) -> dict:
 
 
 def _new_dub_track(d, orig_track, template_seg, index, materials, material, name, placements, ramps=None,
-                   silent=False) -> dict:
+                   silent=False, ducks=None) -> dict:
     """1 track long tieng (chua gan vao draft): cac doan cat tu material theo placements (ramps: vuot tung doan).
     silent=True (track phu cau thua): volume tung doan = 0, khong keyframe -> cau thua KHONG phat ra tieng ke ca
     khi nguoi dung bat nut loa cua track (bai 48: nguoi dung thay track phu van co tieng). Muon nghe lai thi keo
-    volume doan len trong CapCut (last_nonzero_volume = 1.0)."""
+    volume doan len trong CapCut (last_nonzero_volume = 1.0). ducks: vung ha tieng lay hoi tung doan (T-027)."""
     track_pos = len(d["tracks"])
     new_track = {k: copy.deepcopy(v) for k, v in orig_track.items() if k != "segments"}
     new_track["id"] = _new_id()
@@ -206,7 +249,7 @@ def _new_dub_track(d, orig_track, template_seg, index, materials, material, name
         # Khong mang theo keyframe / "Ro dan-Mo dan" (audio_fades) cua doan goc lam mau: chung se
         # chong len keyframe tat tieng cua tool (Tool edit nhac da gap: CapCut ap dung ca hai).
         seg["common_keyframes"] = mute_keyframes(int(dur_us), int(mute_head), int(mute_tail), int(source_us),
-                                                 int(ramp_head), int(ramp_tail))
+                                                 int(ramp_head), int(ramp_tail), ducks[n] if ducks else None)
         if silent:
             seg["volume"] = 0.0             # keyframe am luong se de len volume doan -> bo keyframe
             seg["common_keyframes"] = []
