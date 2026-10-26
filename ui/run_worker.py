@@ -353,15 +353,17 @@ class RunWorker(QThread):
                 groups.setdefault(e.group, []).append(e)
         for e in self._extras:
             log.info("DOAN HO giong goc [%s] %s %.2f-%.2fs tieng %.2fs sau cau %d truoc cau %d giong clip %.2f: '%s'"
-                     " | nhom %d (%d cau)", e.kind, os.path.basename(e.path), e.start, e.end, e.speech, e.after + 1,
-                     e.before + 1, e.reread_sim, e.text, e.group, len(groups.get(e.group, [])))
+                     " | nhom %d (%d cau) | doc lai %s (clip %d: chu %.2f, do dai %.2f)%s", e.kind,
+                     os.path.basename(e.path), e.start, e.end, e.speech, e.after + 1, e.before + 1, e.reread_sim, e.text,
+                     e.group, len(groups.get(e.group, [])), "CO" if e.reread else "khong", e.reread_clip + 1,
+                     e.reread_text, e.reread_len, " | khong dau ket cau (T-029a)" if e.no_end else "")
             where = f"{os.path.basename(e.path)} {e.start:.1f}–{e.end:.1f}s"
             group = groups.get(e.group, [])
             if e.kind == "thua" and e is group[0]:      # doan ho (1 hay nhieu cau, co the vat qua 2 phan): bao 1 dong
                 last = group[-1]
                 span = (f"{os.path.basename(e.path)} {e.start:.1f}–{last.end:.1f}s" if last.path == e.path else
                         f"{os.path.basename(e.path)} {e.start:.1f}s → {os.path.basename(last.path)} {last.end:.1f}s")
-                reread = [x for x in group if x.reread_sim >= pipeline.EXTRA_REREAD_SIM]
+                reread = [x for x in group if x.reread]
                 many = f", {len(group)} câu" if len(group) > 1 else ""
                 self.log.emit(f"Giọng gốc có đoạn không thuộc clip nào (câu gốc đã xóa khỏi timeline?): {span}{many} "
                               f"'{e.text[:80]}' → giọng mới đọc đoạn này sẽ bị XÓA"
@@ -429,11 +431,12 @@ class RunWorker(QThread):
 
         def segment(order):
             plan = self._reading_plan(clips, source_texts, order)
-            durations_ext = [clips[x].target_duration_us / US if kind == "c" else x.end - x.start for kind, x in plan]
+            durations_ext = [clips[x].target_duration_us / US if kind == "c" else x.duration for kind, x in plan]
             texts_in_order = [source_texts[x] if kind == "c" else x.text for kind, x in plan] if source_texts else None
             split_args = dict(labels=[x + 1 if kind == "c" else f"thừa sau {x.after + 1}" for kind, x in plan],
                               pair_gaps=self._plan_gaps(clips, plan),
                               ghosts={k for k, (kind, _) in enumerate(plan) if kind == "g"},
+                              blocks={k for k, (kind, x) in enumerate(plan) if kind == "g" and x.pieces},
                               optional={k for k, (kind, x) in enumerate(plan) if kind == "c" and x in self._optional})
             try:
                 result = segmenter.split_sentences(words, durations_ext, state["silences"], dur, texts_in_order,
@@ -707,14 +710,15 @@ class RunWorker(QThread):
 
     def _reading_plan(self, clips, source_texts, order=None) -> list:
         """Thu tu doc co chen cau MA: [("c", chi so clip) | ("g", ExtraSpeech)]. Cau ma = doan "thua" nam giua 2 clip
-        lien nhau theo thu tu doc (can noi dung cau goc de so nghia). order: mac dinh self._order."""
+        lien nhau theo thu tu doc (can noi dung cau goc de so nghia). order: mac dinh self._order. Cau ma lien nhau cua 1
+        doan ho -> 1 KHOI (pipeline.ghost_blocks, T-029 c)."""
         order = self._order if order is None else order
         extras = [e for e in self._extras if e.kind == "thua"] if source_texts else []
         plan = []
         for k, i in enumerate(order):
             plan.append(("c", i))
             nxt = order[k + 1] if k + 1 < len(order) else None
-            plan += [("g", e) for e in extras if e.after == i and e.before == nxt]
+            plan += [("g", e) for e in pipeline.ghost_blocks([e for e in extras if e.after == i and e.before == nxt])]
         return plan
 
     @staticmethod
@@ -767,7 +771,7 @@ class RunWorker(QThread):
 
     def _place_extras(self, job, ghosts, clips, by_clip, spans, onsets, timeline_end, placements, place_dbg):
         """Cau THUA giong moi doc (cau ma da nhan doan) -> XOA HAN (hotfix 2026-10-22: khong con track phu "câu thừa").
-        Truoc (T-017): track phu tat tieng de nguoi dung nghe kiem tra. Rieng cau ma giong 1 clip >= EXTRA_REREAD_SIM (doc lai, trong doan ho nhieu cau - T-017b): GIU
+        Truoc (T-017): track phu tat tieng de nguoi dung nghe kiem tra. Rieng cau ma CUNG CAU voi 1 clip (e.reread: doc lai, trong doan ho nhieu cau - T-017b, T-029): GIU
         nhu v1.2.6 - du cho (tu het loi cau truoc toi luc noi cau sau >= loi cau + EXTRA_ROOM_SEC) -> track chinh, khong
         du -> track phu. Cac cau khac khong doi. Tra ve (placements track chinh, place_dbg, track phu, canh bao)."""
         aux, main, dropped, kept = [], [], {}, []    # main: [(ExtraSpeech, cau, luc noi)]; dropped: {khuc: [(e, cau)]}
@@ -788,14 +792,14 @@ class RunWorker(QThread):
                 end_ref = clips[e.after].target_start_us + clips[e.after].target_duration_us
                 prev_end = max((d["core_us"][1] for d in place_dbg if d["core_us"][0] <= end_ref), default=0)
             speech_tl = prev_end + lead
-            if e.reread_sim < pipeline.EXTRA_REREAD_SIM:
+            if not e.reread:                   # T-029: doc lai phai cung cau voi 1 clip (pipeline._reread_of)
                 # Hotfix v1.2.10 (nguoi dung 22/10): doan thua XOA HAN, khong dat track phu
                 dropped.setdefault((e.group, run.get(e.group, 0)), []).append((e, sent))
                 log.info("[%s] CHI TIET | cau thua BO: goc %s %.2f-%.2fs '%s' | moi %.3f-%.3fs '%s' giong %.3f | doc_lai %.3f"
                          " | track phu timeline %.3fs", job.name, os.path.basename(e.path), e.start, e.end, e.text,
                          sent.start, sent.end, sent.text, sent.similarity, e.reread_sim, speech_tl / US)
                 continue
-            # doc lai (>= EXTRA_REREAD_SIM) -> giu nhu v1.2.6
+            # doc lai (cung cau voi 1 clip) -> giu nhu v1.2.6
             run[e.group] = run.get(e.group, 0) + 1
             next_speech = min((d["speech_us"] for d in place_dbg if d["core_us"][0] >= prev_end), default=timeline_end)
             room = next_speech - prev_end
@@ -818,6 +822,7 @@ class RunWorker(QThread):
         notes = []
         for items in dropped.values():
             (e0, s0), (e1, s1) = items[0], items[-1]
+            e0, e1 = (e0.pieces or [e0])[0], (e1.pieces or [e1])[-1]     # khoi cau ma vat qua 2 phan: dau / cuoi that
             text = " ".join(s.text for _, s in items)
             reread = max(e.reread_sim for e, _ in items)
             where = (f"{os.path.basename(e0.path)} {e0.start:.1f}–{e1.end:.1f}s" if e1.path == e0.path else
