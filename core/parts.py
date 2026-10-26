@@ -31,9 +31,14 @@ def sort_parts(paths: list) -> list:
 
 
 def is_merged_file(path: str) -> bool:
-    """File ghep cua tool: "<thu muc> Ghép.mp3" (T-030) hoac kieu cu "<ngon ngu> (gộp).mp3" - khong lay lai lam 1 phan."""
+    """File ghep cua tool: "<thu muc> Ghép.mp3" (T-030) hoac kieu cu "<ngon ngu> (gộp).mp3" - khong lay lai lam 1 phan.
+    Ke ca file DO DANG cua lan ghep bi ngat (tool tat giua chung / Drive khoa khong xoa duoc): "... Ghép.mp3.part.mp3",
+    "... (gộp).mp3.part.mp3" va file ghi thu ".nhanban_ghi_thu.tmp" (QA T-030: file do dang bi lay lam phan 1)."""
     name = unicodedata.normalize("NFC", os.path.basename(path))
-    return "(gộp)" in name or os.path.splitext(name)[0].endswith(MERGED_TAG)
+    low = name.lower()
+    return ("(gộp)" in name or os.path.splitext(name)[0].endswith(MERGED_TAG) or low.endswith(TEMP_SUFFIX)
+            or (MERGED_TAG + MERGED_EXT + ".") in name or ("(gộp)" + MERGED_EXT + ".") in name
+            or low == PROBE_NAME)
 
 
 def audio_files_in(folder: str) -> list:
@@ -64,6 +69,7 @@ MERGED_TAG = " Ghép"
 MERGED_EXT = ".mp3"
 OLD_SUFFIX = " (gộp).mp3"     # kieu cu (<= v1.2.10): van dung lai neu cung chu ky
 TEMP_SUFFIX = ".part.mp3"     # hau to dai nhat cua file canh file gop (.json ngan hon)
+PROBE_NAME = ".nhanban_ghi_thu.tmp"     # file ghi thu quyen ghi thu muc (_writable)
 
 
 FALLBACK_SUBDIR = "voice nhan ban"     # thu muc trong project CapCut khi khong ghi duoc canh cac phan
@@ -111,7 +117,7 @@ def _writable(folder: str) -> bool:
     """Ghi thu 1 file nho vao thu muc (khong quyen / thu muc chi doc / o mang loi -> False)."""
     try:
         os.makedirs(folder, exist_ok=True)
-        probe = os.path.join(folder, ".nhanban_ghi_thu.tmp")
+        probe = os.path.join(folder, PROBE_NAME)
         with open(probe, "wb") as f:
             f.write(b"0")
         os.remove(probe)
