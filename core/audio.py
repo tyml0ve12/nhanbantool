@@ -68,10 +68,81 @@ def decode_to_pcm(path: str, out_path: str):
         raise AudioError(f"Không giải mã được audio {os.path.basename(path)}:\n{result.stderr[-400:]}")
 
 
-def build_dub_wav(source_audio: str, placements: list, total_duration: float, out_wav: str, ramps: list = None):
+class PcmReader:
+    """Doc doan mau (mono, float -1..1) tu file audio da giai ma ra PCM tam (khong nap ca file vao RAM)."""
+
+    def __init__(self, path: str):
+        import numpy as np
+        fd, self._tmp = tempfile.mkstemp(suffix=".pcm")
+        os.close(fd)
+        decode_to_pcm(path, self._tmp)
+        self._x = np.memmap(self._tmp, dtype=np.int16, mode="r").reshape(-1, CHANNELS)
+
+    def mono(self, a: int, b: int):
+        import numpy as np
+        a, b = max(0, a), min(len(self._x), b)
+        if b <= a:
+            return np.zeros(0, dtype=np.float32)
+        return self._x[a:b].astype(np.float32).mean(axis=1) / 32768
+
+    def close(self):
+        self._x._mmap.close()
+        del self._x
+        try:
+            os.remove(self._tmp)
+        except OSError:
+            pass
+
+
+FEAT_WIN_SEC = 0.03
+
+
+def pitch_hf_frames(path: str, n_frames: int, frame_sec: float = LEVEL_FRAME_SEC) -> tuple:
+    """(R, H) moi khung 10ms (cua so 30ms tam o giua khung) cua ca file, tinh gop bang FFT - giong het
+    thu_nghiem_test_v124/t027/loud2.py cua Tester (T-027 vong 2): R = tu tuong quan chuan hoa lon nhat 70-400 Hz sau loc
+    thap 1 kHz (co cao do khi >= 0.6), H = ti le nang luong > 2.5 kHz tren > 80 Hz. Doc PCM tam theo tung khuc."""
+    import numpy as np
+    win = int(FEAT_WIN_SEC * SAMPLE_RATE)
+    fr = np.fft.rfftfreq(win, 1 / SAMPLE_RATE)
+    lp, hf, al = fr <= 1000, fr >= 2500, fr >= 80
+    l0, l1 = int(SAMPLE_RATE / 400), int(SAMPLE_RATE / 70)
+    hann = np.hanning(win).astype(np.float32)
+    lag_norm = (1 - np.arange(l1 + 1) / win)[None, :]
+    R = np.zeros(n_frames, np.float32)
+    H = np.zeros(n_frames, np.float32)
+    reader = PcmReader(path)
+    try:
+        total = len(reader._x)
+        batch = 4000
+        for s in range(0, n_frames, batch):
+            idx = np.arange(s, min(n_frames, s + batch))
+            c = ((idx + 0.5) * frame_sec * SAMPLE_RATE).astype(int) - win // 2
+            c = np.clip(c, 0, max(0, total - win))
+            lo, hi = int(c.min()), int(c.max()) + win
+            chunk = reader.mono(lo, hi)
+            if len(chunk) < hi - lo:
+                chunk = np.pad(chunk, (0, hi - lo - len(chunk)))
+            M = chunk[(c - lo)[:, None] + np.arange(win)[None, :]]
+            M = M - M.mean(axis=1, keepdims=True)
+            Sx = np.fft.rfft(M * hann, axis=1)
+            P = np.abs(Sx) ** 2 + 1e-18
+            H[idx] = P[:, hf].sum(1) / P[:, al].sum(1)
+            y = np.fft.irfft(np.where(lp[None, :], Sx, 0), n=win, axis=1)
+            Y = np.fft.rfft(y, n=2 * win, axis=1)
+            ac = np.fft.irfft(np.abs(Y) ** 2, axis=1)[:, :l1 + 1]
+            norm = ac[:, :1] * lag_norm
+            R[idx] = (ac[:, l0:l1 + 1] / np.maximum(norm[:, l0:l1 + 1], 1e-12)).max(1)
+    finally:
+        reader.close()
+    return R, H
+
+
+def build_dub_wav(source_audio: str, placements: list, total_duration: float, out_wav: str, ramps: list = None,
+                  ducks: list = None):
     """placements: [(vi_tri_tren_timeline, cat_tu, thoi_luong[, tat_dau, tat_cuoi])] (giay), da sap
     xep, khong chong nhau. tat_dau/tat_cuoi: phan keo dai o 2 dau doan -> am luong 0 (giong keyframe
     trong draft). ramps: [(vuot_dau, vuot_cuoi)] (giay) song song placements - giong LanguageTrack.ramps.
+    ducks: [[(dau, cuoi)] vung ha tieng lay hoi dau / duoi cau (giay, vi tri trong doan)] - giong LanguageTrack.ducks (T-027).
     Ghi ra file WAV dai dung total_duration: cho nao co cau thi co tieng, con lai im lang."""
     import wave
 
@@ -101,6 +172,9 @@ def build_dub_wav(source_audio: str, placements: list, total_duration: float, ou
                     if overlap > SAMPLE_RATE // 100:
                         raise AudioError("Các câu bị chồng lên nhau khi dựng audio (lỗi nội bộ).")
                     t0, s0, want, head = written, s0 + overlap, want - overlap, max(0, head - overlap)
+                    duck_shift = overlap
+                else:
+                    duck_shift = 0
                 if t0 >= total_frames:
                     break
                 _write_silence(out, t0 - written)
@@ -108,7 +182,9 @@ def build_dub_wav(source_audio: str, placements: list, total_duration: float, ou
                 src.seek(s0 * BYTES_PER_FRAME)
                 data = src.read(n * BYTES_PER_FRAME)
                 ramp_head, ramp_tail = (r * 1000 for r in ramps[k]) if ramps else (None, None)
-                data = _mute_edges(data, head, max(0, tail - (want - n)), ramp_head_ms=ramp_head, ramp_tail_ms=ramp_tail)
+                duck = [tuple(int(round(x * SAMPLE_RATE)) - duck_shift for x in r) for r in ducks[k]] if ducks else None
+                data = _mute_edges(data, head, max(0, tail - (want - n)), ramp_head_ms=ramp_head, ramp_tail_ms=ramp_tail,
+                                   ducks=duck)
                 out.writeframes(_fade(data))
                 written = t0 + len(data) // BYTES_PER_FRAME
             _write_silence(out, total_frames - written)
@@ -127,15 +203,21 @@ def _write_silence(out, frames):
         frames -= n
 
 
+DUCK_GAIN = 0.1      # ha tieng lay hoi dau cau -20 dB (giong draft_patch.DUCK_GAIN, T-027)
+DUCK_RAMP_MS = 10
+
+
 def _mute_edges(data: bytes, head_frames: int, tail_frames: int, ramp_ms: int = 10,
-                ramp_head_ms: float = None, ramp_tail_ms: float = None) -> bytes:
+                ramp_head_ms: float = None, ramp_tail_ms: float = None, ducks=None) -> bytes:
     """Tat tieng (0) phan keo dai dau/cuoi doan - giong keyframe am luong ghi vao draft CapCut
     (0 -> vuot 10ms -> 100% ... 100% -> vuot 10ms -> 0). ramp_head_ms / ramp_tail_ms > ramp_ms: mep nghe duoc giua
-    tieng to -> vuot dai hon, ke ca khi khong co phan keo dai (giong mute_keyframes, T-001)."""
+    tieng to -> vuot dai hon, ke ca khi khong co phan keo dai (giong mute_keyframes, T-001). ducks [(dau, cuoi)] (mau):
+    vung am luong DUCK_GAIN, vuot DUCK_RAMP_MS trong vung; cham dau / cuoi phan nghe duoc thi noi lien phan tat tieng
+    (ha tieng lay hoi dau / duoi cau, giong draft - T-027). Am luong = min(duong tat tieng, duong ha hoi)."""
     ramp_head_ms = ramp_ms if ramp_head_ms is None else ramp_head_ms
     ramp_tail_ms = ramp_ms if ramp_tail_ms is None else ramp_tail_ms
     long_head, long_tail = ramp_head_ms > ramp_ms, ramp_tail_ms > ramp_ms
-    if head_frames <= 0 and tail_frames <= 0 and not long_head and not long_tail:
+    if head_frames <= 0 and tail_frames <= 0 and not long_head and not long_tail and not ducks:
         return data
     import numpy as np
     x = np.frombuffer(data, dtype=np.int16).reshape(-1, CHANNELS).astype(np.float32)
@@ -155,6 +237,22 @@ def _mute_edges(data: bytes, head_frames: int, tail_frames: int, ramp_ms: int = 
         env[t:] = 0
         lo = max(0, t - ramp_tail)
         env[lo:t] = np.minimum(env[lo:t], np.linspace(1, 0, t - lo, endpoint=False))
+    if ducks:
+        dr = int(SAMPLE_RATE * DUCK_RAMP_MS / 1000)
+        aud0, aud1 = max(0, head_frames), n - max(0, tail_frames)
+        duck = np.ones(n, dtype=np.float32)
+        for ds, de in sorted(ducks):
+            ds, de = max(int(ds), aud0), min(int(de), aud1)
+            if de - ds < 2 * dr:
+                continue
+            a = 0 if ds <= aud0 else ds
+            b = n if de >= aud1 else de
+            duck[a:b] = DUCK_GAIN
+            if ds > aud0:
+                duck[ds:ds + dr] = np.linspace(1, DUCK_GAIN, dr, endpoint=False)
+            if de < aud1:
+                duck[de - dr:de] = np.linspace(DUCK_GAIN, 1, dr, endpoint=False)
+        env = np.minimum(env, duck)
     return (x * env[:, None]).round().astype(np.int16).tobytes()
 
 
