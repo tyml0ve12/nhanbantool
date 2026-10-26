@@ -1,4 +1,4 @@
-APP_VERSION = "1.2.10"
+APP_VERSION = "1.2.11"
 
 # Repo GitHub chua ban phat hanh, dang "ten-tai-khoan/ten-repo". De trong = tat tu cap nhat.
 GITHUB_REPO = "tyml0ve12/nhanbantool"
