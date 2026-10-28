@@ -62,7 +62,7 @@ SKIP_UNSURE_SIM = 0.5
 SKIP_NEIGHBOR_GAP = 0.2       # thap hon cau ben canh (thap nhat) it nhat muc nay
 SKIP_PENALTY = 0.5
 SKIP_SPAN_FACTOR = 1.3        # doan so toi da dai 1.3 x ti le toc do x (cau k + cau ben canh dai hon)
-MAX_MISSING = 5               # thieu > 5 cau -> bao loi ngon ngu do, khong xep (nguoi dung chot 2026-10-21)
+MAX_MISSING_SHARE = 0.50      # thieu > 50% so cau -> bao loi ngon ngu do, khong xep (nguoi dung chot 28/10; truoc: > 5 cau)
 # Cau MA (ghosts): cau goc da xoa khoi timeline nhung con trong file giong goc (pipeline.find_extra_speech) - giong
 # moi co the doc thua. Tuy chon: duoc bo qua (buoc 0, khong tinh la thieu), khong gop 2:1 voi cau ben canh, chi nhan
 # doan giong moi khi do giong >= GHOST_MIN_SIM (chan ca thieu + thua triet nhau).
@@ -79,7 +79,7 @@ OPTIONAL_MIN_SIM = 0.58
 MIN_CORRELATION = 0.60    # do khop do dai duoi muc nay -> bao loi
 WARN_CORRELATION = 0.80
 LOW_SIMILARITY = 0.35     # cau co do giong nghia duoi muc nay -> canh bao
-MAX_LOW_SIMILARITY_SHARE = 0.10   # qua 10% so cau khong khop noi dung -> bao loi
+MAX_LOW_SIMILARITY_SHARE = 0.50   # qua 50% so cau khong khop noi dung -> bao loi (nguoi dung chot 28/10; truoc: 10%)
 OUTLIER_LOG_RATIO = 0.70
 
 PAD_BEFORE = 0.05         # giu them truoc tieng dau cau (giay)
@@ -349,8 +349,8 @@ def split_sentences(words, original_durations, silences, audio_duration,
         expected[k] = sum(original_durations[k:k + step])
         if step == 2:
             merged.append((labels[k], labels[k + 1]))
-    if len(missing) > MAX_MISSING:
-        raise SegmentError(f"Giọng mới THIẾU {len(missing)} câu (quá {MAX_MISSING} câu): "
+    if len(missing) > MAX_MISSING_SHARE * n:
+        raise SegmentError(f"Giọng mới THIẾU {len(missing)}/{n} câu (quá {MAX_MISSING_SHARE:.0%} số câu): "
                            + "; ".join(f"câu {labels[k]} '{texts[k][:50]}'" for k in missing[:12])
                            + (" …" if len(missing) > 12 else "") + ". Kiểm tra lại file voice (thiếu đoạn / thiếu phần?).")
     present = [k for k in range(n) if sentences[k] is not None]
