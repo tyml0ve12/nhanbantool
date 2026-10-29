@@ -61,6 +61,21 @@ class RunConfig:
     output_paths: dict = None        # {row: duong dan mp4} - ten file do nguoi dung dat
 
 
+def _mmss(us) -> str:
+    """Micro giay -> "phut:giay" (qua 1 gio -> "gio:phut:giay") nhu thuoc thoi gian CapCut."""
+    sec = int(us // US)
+    h, m, s = sec // 3600, sec // 60 % 60, sec % 60
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+
+def _with_time(warning: str, at: dict) -> str:
+    """"Câu N[ + M] ..." -> "Câu N[ + M] (mm:ss) ..." theo vi tri cau N tren timeline (at: {so cau: micro giay})."""
+    m = re.match(r"Câu (\d+)(?: \+ \d+)?", warning)
+    if not m or int(m.group(1)) not in at:
+        return warning
+    return f"{m.group(0)} ({_mmss(at[int(m.group(1))])}){warning[m.end():]}"
+
+
 class RunWorker(QThread):
     log = Signal(str)
     language_status = Signal(int, str, str)   # row, text, kind (wait/run/ok/warn/error)
@@ -543,6 +558,9 @@ class RunWorker(QThread):
             detail = ", ".join(f"câu {i} ({d:+.1f}s)" for i, d in report.far[:8])
             more = f" và {len(report.far) - 8} câu khác" if len(report.far) > 8 else ""
             warnings.append(f"{len(report.far)} câu lệch mốc gốc hơn 5 giây: {detail}{more} — nên nghe kiểm tra.")
+        # Canh bao "Câu N ..." -> kem phut:giay tren timeline CapCut sau khi xep (luc cau moi bat dau noi)
+        at = {d["clip"] + 1: d["speech_us"] for d in place_dbg if isinstance(d["clip"], int)}
+        warnings = [_with_time(w, at) for w in warnings]
         for w in warnings:
             self.log.emit(f"[{job.name}] Cảnh báo: {w}")
         result.warnings = warnings
