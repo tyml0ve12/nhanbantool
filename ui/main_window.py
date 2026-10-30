@@ -31,6 +31,7 @@ from ui.language_dialog import (
 from ui.logo_dialog import edit_logo, logo_label
 from core.render import probe_video
 from ui.export_dialog import ExportDialog
+from ui.script_break_dialog import ScriptBreakDialog
 from ui.update_ui import UpdateController
 from ui.run_worker import RunWorker, RunConfig, LanguageJob, MODE_DRAFT, MODE_EXPORT, MODE_BOTH
 
@@ -249,7 +250,10 @@ class MainWindow(QMainWindow):
         multi_btn.clicked.connect(self._add_many_languages)
         remove_btn = QPushButton("Xoá dòng")
         remove_btn.clicked.connect(self._remove_selected)
-        for b in (add_btn, multi_btn):
+        break_btn = QPushButton("TẠO KỊCH BẢN NGẮT")
+        break_btn.setToolTip("Chèn ký hiệu ngắt nghỉ (ai33 / Google voice / Minimax…) vào kịch bản trước khi đọc giọng")
+        break_btn.clicked.connect(self._open_script_break)
+        for b in (add_btn, multi_btn, break_btn):
             toolbar.addWidget(b)
         toolbar.addStretch(1)
         toolbar.addWidget(remove_btn)
@@ -286,6 +290,9 @@ class MainWindow(QMainWindow):
         hint.setWordWrap(True)
         v.addWidget(hint)
         return box
+
+    def _open_script_break(self):
+        ScriptBreakDialog(self).exec()
 
     def _build_run_box(self):
         box = QGroupBox("3. Chạy")
