@@ -128,8 +128,8 @@ class ScriptBreakDialog(QDialog):
         btns.addStretch(1)
         preview_btn = QPushButton("Xem trước")
         preview_btn.clicked.connect(self._preview)
-        save_btn = QPushButton("Tải .txt")
-        save_btn.clicked.connect(self._save_txt)
+        save_btn = QPushButton("Tải file Word")
+        save_btn.clicked.connect(self._save_file)
         close_btn = QPushButton("Đóng")
         close_btn.clicked.connect(self.close)
         for b in (preview_btn, save_btn, close_btn):
@@ -177,18 +177,24 @@ class ScriptBreakDialog(QDialog):
     def _preview(self):
         self._result()
 
-    def _save_txt(self):
+    def _save_file(self):
         out = self._result()
         if out is None:
             return
         folder = self.settings.value("script_break/folder", "")
-        name = "kich_ban_ngat_" + re.sub(r'[\\/:*?"<>|]', "_", self.tool_combo.currentText()) + ".txt"
-        path, _ = QFileDialog.getSaveFileName(self, "Lưu kịch bản ngắt", os.path.join(folder, name), "Text (*.txt)")
+        name = "kich_ban_ngat_" + re.sub(r'[\\/:*?"<>|]', "_", self.tool_combo.currentText()) + ".docx"
+        path, chosen = QFileDialog.getSaveFileName(self, "Lưu kịch bản ngắt", os.path.join(folder, name),
+                                                   "Word (*.docx);;Text (*.txt)")
         if not path:
             return
         try:
-            with open(path, "w", encoding="utf-8", newline="") as f:
-                f.write(out)
+            if path.lower().endswith(".txt") or chosen.startswith("Text"):
+                with open(path, "w", encoding="utf-8", newline="") as f:
+                    f.write(out)
+            else:
+                if not path.lower().endswith(".docx"):
+                    path += ".docx"
+                script_break.save_docx(path, out)
         except OSError as e:
             QMessageBox.critical(self, "Tạo kịch bản ngắt", f"Không lưu được file:\n{e}")
             return

@@ -7,13 +7,15 @@
 """
 import json
 import os
+import zipfile
+from xml.sax.saxutils import escape
 
 from core.paths import get_app_dir
 
 DEFAULT_TOOLS = [
-    {"name": "ai33", "marker": "<#0.5#>"},
-    {"name": "Google voice", "marker": '<break time="500ms"/>'},
-    {"name": "Minimax", "marker": "<#0.5#>"},
+    {"name": "ai33", "marker": "[pause]"},
+    {"name": "Google voice", "marker": "<long pause>"},
+    {"name": "Minimax", "marker": "<#1.0#>"},
 ]
 
 END_MARKS = ".!?。！？؟"
@@ -103,3 +105,32 @@ def insert_breaks(text: str, marker: str) -> str:
     if not marker:
         return text
     return "\n".join(_break_line(line, marker) for line in text.split("\n"))
+
+
+_DOCX_TYPES = (
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+    '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+    '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+    '<Default Extension="xml" ContentType="application/xml"/>'
+    '<Override PartName="/word/document.xml" '
+    'ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>')
+_DOCX_RELS = (
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+    '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+    '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" '
+    'Target="word/document.xml"/></Relationships>')
+
+
+def save_docx(path: str, text: str):
+    """Ghi file Word toi gian (moi dong 1 doan), khong can thu vien ngoai (may nguoi dung khong co python-docx)."""
+    paras = "".join(
+        f'<w:p><w:r><w:t xml:space="preserve">{escape(line.rstrip(chr(13)))}</w:t></w:r></w:p>'
+        for line in text.split("\n"))
+    doc = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+           '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+           f'<w:body>{paras}</w:body></w:document>')
+    with zipfile.ZipFile(path + ".tmp", "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("[Content_Types].xml", _DOCX_TYPES)
+        z.writestr("_rels/.rels", _DOCX_RELS)
+        z.writestr("word/document.xml", doc)
+    os.replace(path + ".tmp", path)
